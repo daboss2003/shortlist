@@ -80,7 +80,7 @@ class InviteNotRedeemedError extends Error {}
  */
 export async function registerCompany(input: unknown, inviteToken: unknown): Promise<RegisterResult> {
   // Cheap early exit so invite-less submissions never cost a password hash. Redemption below re-checks atomically.
-  const invite = findUsableInvite(inviteToken);
+  const invite = await findUsableInvite(inviteToken);
   if (!invite) return inviteFailure();
 
   const parsed = signupSchema.safeParse(input);
@@ -97,19 +97,22 @@ export async function registerCompany(input: unknown, inviteToken: unknown): Pro
   const data = parsed.data;
   if (invite.email && invite.email !== data.email) return inviteFailure();
 
-  // Hash first: better-sqlite3 transactions are synchronous and can't span an await.
+  // Hash before the transaction so the slow scrypt never runs while it holds locks or a pooled connection.
   const passwordHash = await hashPassword(data.password);
   try {
-    const userId = db.transaction((tx) => {
-      const company = tx.insert(companies).values({ name: data.companyName, website: data.website }).returning().get();
-      const id = tx
+    const userId = await db.transaction(async (tx) => {
+      const [company] = await tx
+        .insert(companies)
+        .values({ name: data.companyName, website: data.website })
+        .returning({ id: companies.id });
+      const [user] = await tx
         .insert(users)
         .values({ companyId: company.id, name: data.name, email: data.email, passwordHash })
-        .returning({ id: users.id })
-        .get().id;
-      // Used, revoked or expired since the check above (e.g. a parallel signup with the same link): roll back.
-      if (!redeemInvite(tx, inviteToken, id, data.email)) throw new InviteNotRedeemedError();
-      return id;
+        .returning({ id: users.id });
+      // Used, revoked or expired since the check above (e.g. a parallel signup with the same link): throwing
+      // rolls back the company and user.
+      if (!(await redeemInvite(tx, inviteToken, user.id, data.email))) throw new InviteNotRedeemedError();
+      return user.id;
     });
     return { ok: true, userId };
   } catch (err) {
@@ -122,9 +125,11 @@ export async function registerCompany(input: unknown, inviteToken: unknown): Pro
 }
 
 /** Whether an account already uses this email (any casing). */
-export function accountExists(email: string): boolean {
+export async function accountExists(email: string): Promise<boolean> {
   const normalized = email.trim().toLowerCase();
-  return !!normalized && !!db.select({ id: users.id }).from(users).where(eq(users.email, normalized)).get();
+  if (!normalized) return false;
+  const [user] = await db.select({ id: users.id }).from(users).where(eq(users.email, normalized)).limit(1);
+  return !!user;
 }
 
 // A real scrypt hash (same N/r/p and key length as hashPassword) of a random password nobody knows.
@@ -134,9 +139,13 @@ const DUMMY_PASSWORD_HASH =
 /** Returns the user id when the email + password match, else null. */
 export async function authenticate(email: string, password: string): Promise<string | null> {
   const normalized = email.trim().toLowerCase();
-  const user = normalized
-    ? db.select({ id: users.id, passwordHash: users.passwordHash }).from(users).where(eq(users.email, normalized)).get()
-    : undefined;
+  const [user] = normalized
+    ? await db
+        .select({ id: users.id, passwordHash: users.passwordHash })
+        .from(users)
+        .where(eq(users.email, normalized))
+        .limit(1)
+    : [];
   if (!user) {
     // Intentional: verify against a dummy hash for unknown emails so the response takes as long as a
     // wrong password would — otherwise response timing reveals which emails have accounts.
@@ -146,7 +155,10 @@ export async function authenticate(email: string, password: string): Promise<str
   return (await verifyPassword(password, user.passwordHash)) ? user.id : null;
 }
 
+/** Postgres unique_violation (23505). Drizzle wraps the driver error, so walk the cause chain. */
 function isUniqueViolation(err: unknown): boolean {
-  const code = (err as { code?: string })?.code ?? (err as { cause?: { code?: string } })?.cause?.code;
-  return code === "SQLITE_CONSTRAINT_UNIQUE";
+  for (let e = err, depth = 0; e && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
+    if ((e as { code?: unknown }).code === "23505") return true;
+  }
+  return false;
 }

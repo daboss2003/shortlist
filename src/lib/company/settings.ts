@@ -10,14 +10,13 @@ import { RETENTION_DAY_OPTIONS, type RetentionDays } from "@/lib/retention";
 
 export type CompanySettings = { name: string; website: string | null; retentionDays: number | null };
 
-export function getCompanySettings(companyId: string): CompanySettings | null {
-  return (
-    db
-      .select({ name: companies.name, website: companies.website, retentionDays: companies.retentionDays })
-      .from(companies)
-      .where(eq(companies.id, companyId))
-      .get() ?? null
-  );
+export async function getCompanySettings(companyId: string): Promise<CompanySettings | null> {
+  const [settings] = await db
+    .select({ name: companies.name, website: companies.website, retentionDays: companies.retentionDays })
+    .from(companies)
+    .where(eq(companies.id, companyId))
+    .limit(1);
+  return settings ?? null;
 }
 
 export const companyProfileSchema = z.object({ name: companyNameSchema, website: websiteSchema });
@@ -26,10 +25,10 @@ export type CompanyProfileField = keyof CompanyProfile;
 export type CompanyProfileFieldErrors = Partial<Record<CompanyProfileField, string>>;
 
 /** Validates and saves the company name and website (same rules as signup). */
-export function updateCompanyProfile(
+export async function updateCompanyProfile(
   companyId: string,
   input: unknown,
-): { ok: true; profile: CompanyProfile } | { ok: false; fieldErrors: CompanyProfileFieldErrors } {
+): Promise<{ ok: true; profile: CompanyProfile } | { ok: false; fieldErrors: CompanyProfileFieldErrors }> {
   const parsed = companyProfileSchema.safeParse(input);
   if (!parsed.success) {
     const { fieldErrors } = z.flattenError(parsed.error);
@@ -40,8 +39,12 @@ export function updateCompanyProfile(
       ) as CompanyProfileFieldErrors,
     };
   }
-  const updated = db.update(companies).set(parsed.data).where(eq(companies.id, companyId)).run().changes;
-  if (updated === 0) throw new Error("Company not found");
+  const updated = await db
+    .update(companies)
+    .set(parsed.data)
+    .where(eq(companies.id, companyId))
+    .returning({ id: companies.id });
+  if (updated.length === 0) throw new Error("Company not found");
   return { ok: true, profile: parsed.data };
 }
 
@@ -49,8 +52,12 @@ export const isRetentionDays = (days: unknown): days is RetentionDays | null =>
   days === null || (RETENTION_DAY_OPTIONS as readonly unknown[]).includes(days);
 
 /** Sets how long candidate data is kept after a job closes; null turns retention off. Only the offered choices. */
-export function setRetentionDays(companyId: string, days: number | null): void {
+export async function setRetentionDays(companyId: string, days: number | null): Promise<void> {
   if (!isRetentionDays(days)) throw new Error(`Unsupported retention period: ${String(days)}`);
-  const updated = db.update(companies).set({ retentionDays: days }).where(eq(companies.id, companyId)).run().changes;
-  if (updated === 0) throw new Error("Company not found");
+  const updated = await db
+    .update(companies)
+    .set({ retentionDays: days })
+    .where(eq(companies.id, companyId))
+    .returning({ id: companies.id });
+  if (updated.length === 0) throw new Error("Company not found");
 }

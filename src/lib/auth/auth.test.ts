@@ -25,33 +25,48 @@ describe("password hashing", () => {
 });
 
 describe("sessions", () => {
-  it("resolves a token to its employer and company", () => {
-    const { company, user } = makeCompany("Globex");
-    const { token } = insertSession(user.id);
-    expect(findEmployerBySessionToken(token)).toMatchObject({
+  it("resolves a token to its employer and company", async () => {
+    const { company, user } = await makeCompany("Globex");
+    const { token } = await insertSession(user.id);
+    expect(await findEmployerBySessionToken(token)).toEqual({
       userId: user.id,
+      name: user.name,
+      email: user.email,
       companyId: company.id,
       companyName: "Globex",
+      companyWebsite: null,
+      isPlatformAdmin: false,
     });
   });
 
-  it("stores only a hash of the token", () => {
-    const { user } = makeCompany();
-    const { token } = insertSession(user.id);
-    const rows = db.select().from(sessions).where(eq(sessions.userId, user.id)).all();
+  it("stores only a hash of the token", async () => {
+    const { user } = await makeCompany();
+    const { token } = await insertSession(user.id);
+    const rows = await db.select().from(sessions).where(eq(sessions.userId, user.id));
+    expect(rows).toHaveLength(1);
     expect(rows.some((r) => r.id === token)).toBe(false);
   });
 
-  it("rejects unknown, deleted and expired tokens", () => {
-    const { user } = makeCompany();
-    expect(findEmployerBySessionToken("nope")).toBeNull();
+  it("rejects unknown, deleted and expired tokens", async () => {
+    const { user } = await makeCompany();
+    expect(await findEmployerBySessionToken("nope")).toBeNull();
 
-    const { token } = insertSession(user.id);
-    deleteSessionByToken(token);
-    expect(findEmployerBySessionToken(token)).toBeNull();
+    const { token } = await insertSession(user.id);
+    await deleteSessionByToken(token);
+    expect(await findEmployerBySessionToken(token)).toBeNull();
 
-    const { token: expired } = insertSession(user.id);
-    db.update(sessions).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(sessions.userId, user.id)).run();
-    expect(findEmployerBySessionToken(expired)).toBeNull();
+    const { token: expired } = await insertSession(user.id);
+    await db.update(sessions).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(sessions.userId, user.id));
+    expect(await findEmployerBySessionToken(expired)).toBeNull();
+  });
+
+  it("clears expired sessions when a new one starts", async () => {
+    const { user } = await makeCompany();
+    await insertSession(user.id);
+    await db.update(sessions).set({ expiresAt: new Date(Date.now() - 1000) }).where(eq(sessions.userId, user.id));
+    const { token } = await insertSession(user.id);
+    const rows = await db.select().from(sessions).where(eq(sessions.userId, user.id));
+    expect(rows).toHaveLength(1);
+    expect(await findEmployerBySessionToken(token)).toMatchObject({ userId: user.id });
   });
 });

@@ -13,7 +13,7 @@ export const getCurrentEmployer = cache(async (): Promise<Employer | null> => {
   // Intentional: cookies() alone still allows a runtime prefetch, where the session-expiry check's
   // `new Date()` is rejected. connection() pins this (and every tenant read after it) to the real request.
   await connection();
-  return token ? findEmployerBySessionToken(token) : null;
+  return token ? await findEmployerBySessionToken(token) : null;
 });
 
 /** For pages and Server Actions: redirects to /login when signed out. */

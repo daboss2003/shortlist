@@ -24,7 +24,7 @@ export default function SettingsPage() {
 
 async function SettingsContent() {
   const { companyId } = await requireEmployer();
-  const settings = getCompanySettings(companyId);
+  const settings = await getCompanySettings(companyId);
   if (!settings) notFound();
 
   return (

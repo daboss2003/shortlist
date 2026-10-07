@@ -1,11 +1,10 @@
 import { createHash } from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { candidates, jobs } from "@/db/schema";
 import { createCandidateFromCv, type ValidatedCv } from "@/lib/candidates/intake";
+import { cvFileExists } from "@/lib/storage";
 import { makeCompany } from "../../../test/factories";
 import {
   countJobCandidates,
@@ -54,7 +53,7 @@ const pdfCv = (): ValidatedCv => {
     sha256: createHash("sha256").update(bytes).digest("hex"),
   };
 };
-const cvPath = (key: string) => path.join(process.env.UPLOAD_DIR!, key);
+const jobRow = async (id: string) => (await db.select().from(jobs).where(eq(jobs.id, id)))[0];
 
 describe("parseJobInput", () => {
   it("trims text and turns blank optional fields into null", () => {
@@ -126,28 +125,28 @@ describe("slugs", () => {
     expect(slugify("日本語")).toBe("");
   });
 
-  it("is the slugified title (max 48 chars) plus a 10-char random suffix, unique per job", () => {
-    const { company } = makeCompany();
-    const a = createJob(company.id, parse({ title: "Senior Backend Engineer" }));
-    const b = createJob(company.id, parse({ title: "Senior Backend Engineer" }));
+  it("is the slugified title (max 48 chars) plus a 10-char random suffix, unique per job", async () => {
+    const { company } = await makeCompany();
+    const a = await createJob(company.id, parse({ title: "Senior Backend Engineer" }));
+    const b = await createJob(company.id, parse({ title: "Senior Backend Engineer" }));
     expect(a.slug).toMatch(/^senior-backend-engineer-[a-z0-9]{10}$/);
     expect(b.slug).toMatch(/^senior-backend-engineer-[a-z0-9]{10}$/);
     expect(a.slug).not.toBe(b.slug);
 
-    const long = createJob(company.id, parse({ title: "Principal Staff Software Engineer, Payments Infrastructure Platform" }));
+    const long = await createJob(company.id, parse({ title: "Principal Staff Software Engineer, Payments Infrastructure Platform" }));
     const [prefix] = long.slug.split(/-(?=[a-z0-9]{10}$)/);
     expect(prefix.length).toBeLessThanOrEqual(48);
     expect(prefix.endsWith("-")).toBe(false);
     expect(long.slug).toMatch(/^principal-staff-software-engineer-payments-infra-[a-z0-9]{10}$/);
 
-    expect(createJob(company.id, parse({ title: "日本語" })).slug).toMatch(/^job-[a-z0-9]{10}$/);
+    expect((await createJob(company.id, parse({ title: "日本語" }))).slug).toMatch(/^job-[a-z0-9]{10}$/);
   });
 });
 
 describe("createJob / updateJob", () => {
-  it("creates an open job for the company", () => {
-    const { company } = makeCompany();
-    const job = createJob(company.id, parse());
+  it("creates an open job for the company", async () => {
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
     expect(job).toMatchObject({
       companyId: company.id,
       status: "open",
@@ -158,83 +157,100 @@ describe("createJob / updateJob", () => {
       skills: ["Node.js", "TypeScript", "PostgreSQL"],
       minExperienceYears: 5,
     });
-    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()).toMatchObject({ slug: job.slug });
+    expect(await jobRow(job.id)).toMatchObject({ slug: job.slug, skills: ["Node.js", "TypeScript", "PostgreSQL"] });
   });
 
-  it("updates the fields but never the slug", () => {
-    const { company } = makeCompany();
-    const job = createJob(company.id, parse());
-    const updated = updateJob(company.id, job.id, parse({ title: "Staff Engineer", skills: "Go", minExperienceYears: "" }));
+  it("updates the fields but never the slug", async () => {
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
+    const updated = await updateJob(company.id, job.id, parse({ title: "Staff Engineer", skills: "Go", minExperienceYears: "" }));
     expect(updated).toMatchObject({ id: job.id, title: "Staff Engineer", skills: ["Go"], minExperienceYears: null, slug: job.slug });
+    expect(updated!.updatedAt.getTime()).toBeGreaterThanOrEqual(job.updatedAt.getTime());
   });
 
-  it("returns null for a missing job or another company's job and leaves it untouched", () => {
-    const a = makeCompany();
-    const b = makeCompany();
-    const job = createJob(a.company.id, parse());
-    expect(updateJob(b.company.id, job.id, parse({ title: "Hijacked" }))).toBeNull();
-    expect(updateJob(a.company.id, "missing-id", parse())).toBeNull();
-    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.title).toBe("Senior Backend Engineer");
+  it("returns null for a missing job or another company's job and leaves it untouched", async () => {
+    const a = await makeCompany();
+    const b = await makeCompany();
+    const job = await createJob(a.company.id, parse());
+    expect(await updateJob(b.company.id, job.id, parse({ title: "Hijacked" }))).toBeNull();
+    expect(await updateJob(a.company.id, "missing-id", parse())).toBeNull();
+    expect((await jobRow(job.id)).title).toBe("Senior Backend Engineer");
   });
 });
 
 describe("newestJobId", () => {
-  it("is the company's most recently created job, changing with every new job", () => {
-    const a = makeCompany();
-    const b = makeCompany();
-    expect(newestJobId(a.company.id)).toBeNull();
-    const first = createJob(a.company.id, parse());
-    expect(newestJobId(a.company.id)).toBe(first.id);
-    db.update(jobs).set({ createdAt: new Date(Date.now() - 60_000) }).where(eq(jobs.id, first.id)).run();
-    const second = createJob(a.company.id, parse());
-    expect(newestJobId(a.company.id)).toBe(second.id);
-    createJob(b.company.id, parse());
-    expect(newestJobId(a.company.id)).toBe(second.id);
+  it("is the company's most recently created job, changing with every new job", async () => {
+    const a = await makeCompany();
+    const b = await makeCompany();
+    expect(await newestJobId(a.company.id)).toBeNull();
+    const first = await createJob(a.company.id, parse());
+    expect(await newestJobId(a.company.id)).toBe(first.id);
+    await db.update(jobs).set({ createdAt: new Date(Date.now() - 60_000) }).where(eq(jobs.id, first.id));
+    const second = await createJob(a.company.id, parse());
+    expect(await newestJobId(a.company.id)).toBe(second.id);
+    await createJob(b.company.id, parse());
+    expect(await newestJobId(a.company.id)).toBe(second.id);
   });
 });
 
 describe("setJobStatus", () => {
-  it("closes and reopens the company's own job", () => {
-    const { company } = makeCompany();
-    const job = createJob(company.id, parse());
-    expect(setJobStatus(company.id, job.id, "closed")).toBe(true);
-    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("closed");
-    expect(setJobStatus(company.id, job.id, "open")).toBe(true);
-    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("open");
+  it("closes and reopens the company's own job", async () => {
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
+    expect(await setJobStatus(company.id, job.id, "closed")).toBe(true);
+    expect((await jobRow(job.id)).status).toBe("closed");
+    expect(await setJobStatus(company.id, job.id, "open")).toBe(true);
+    expect((await jobRow(job.id)).status).toBe("open");
   });
 
-  it("starts the retention clock on close, keeps it on a repeat close, and clears it on reopen", () => {
-    const { company } = makeCompany();
-    const job = createJob(company.id, parse());
-    const closedAt = () => db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.closedAt;
-    expect(closedAt()).toBeNull();
+  it("starts the retention clock on close, keeps it on a repeat close, and clears it on reopen", async () => {
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
+    const closedAt = async () => (await jobRow(job.id)).closedAt;
+    expect(await closedAt()).toBeNull();
 
-    setJobStatus(company.id, job.id, "closed");
-    const first = closedAt();
+    const before = Date.now();
+    await setJobStatus(company.id, job.id, "closed");
+    const first = await closedAt();
     expect(first).toBeInstanceOf(Date);
-    db.update(jobs).set({ closedAt: new Date(first!.getTime() - 1000) }).where(eq(jobs.id, job.id)).run();
-    setJobStatus(company.id, job.id, "closed");
-    expect(closedAt()!.getTime()).toBe(first!.getTime() - 1000);
+    expect(first!.getTime()).toBeGreaterThanOrEqual(before);
+    expect(first!.getTime()).toBeLessThanOrEqual(Date.now());
+    await db.update(jobs).set({ closedAt: new Date(first!.getTime() - 1000) }).where(eq(jobs.id, job.id));
+    await setJobStatus(company.id, job.id, "closed");
+    expect((await closedAt())!.getTime()).toBe(first!.getTime() - 1000);
 
-    setJobStatus(company.id, job.id, "open");
-    expect(closedAt()).toBeNull();
+    await setJobStatus(company.id, job.id, "open");
+    expect(await closedAt()).toBeNull();
   });
 
-  it("cannot change another company's job", () => {
-    const a = makeCompany();
-    const b = makeCompany();
-    const job = createJob(a.company.id, parse());
-    expect(setJobStatus(b.company.id, job.id, "closed")).toBe(false);
-    expect(setJobStatus(a.company.id, "missing-id", "closed")).toBe(false);
-    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("open");
+  it("cannot change another company's job", async () => {
+    const a = await makeCompany();
+    const b = await makeCompany();
+    const job = await createJob(a.company.id, parse());
+    expect(await setJobStatus(b.company.id, job.id, "closed")).toBe(false);
+    expect(await setJobStatus(a.company.id, "missing-id", "closed")).toBe(false);
+    expect((await jobRow(job.id)).status).toBe("open");
+  });
+});
+
+describe("countJobCandidates", () => {
+  it("counts the company's candidates on the job as a number", async () => {
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
+    expect(await countJobCandidates(company.id, job.id)).toBe(0);
+    await createCandidateFromCv({ job, source: "upload", cv: pdfCv() });
+    await createCandidateFromCv({ job, source: "upload", cv: { ...pdfCv(), sha256: "b".repeat(64) } });
+    const n = await countJobCandidates(company.id, job.id);
+    expect(n).toBe(2);
+    expect(typeof n).toBe("number");
   });
 });
 
 describe("deleteJob", () => {
   it("deletes the job, its candidates and their CV files", async () => {
-    const { company } = makeCompany();
-    const job = createJob(company.id, parse());
-    const other = createJob(company.id, parse({ title: "Keep me" }));
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
+    const other = await createJob(company.id, parse({ title: "Keep me" }));
     const c1 = await createCandidateFromCv({ job, source: "upload", cv: pdfCv() });
     const c2 = await createCandidateFromCv({
       job,
@@ -243,29 +259,29 @@ describe("deleteJob", () => {
       applicant: { name: "Ada", email: "ada@example.com", phone: null },
     });
     const kept = await createCandidateFromCv({ job: other, source: "upload", cv: pdfCv() });
-    expect(countJobCandidates(company.id, job.id)).toBe(2);
-    expect(fs.existsSync(cvPath(c1.cvFileKey)) && fs.existsSync(cvPath(c2.cvFileKey))).toBe(true);
+    expect(await countJobCandidates(company.id, job.id)).toBe(2);
+    expect((await cvFileExists(c1.cvFileKey)) && (await cvFileExists(c2.cvFileKey))).toBe(true);
 
     expect(await deleteJob(company.id, job.id)).toBe(true);
 
-    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()).toBeUndefined();
-    expect(db.select().from(candidates).where(eq(candidates.jobId, job.id)).all()).toEqual([]);
-    expect(fs.existsSync(cvPath(c1.cvFileKey))).toBe(false);
-    expect(fs.existsSync(cvPath(c2.cvFileKey))).toBe(false);
-    expect(fs.existsSync(cvPath(kept.cvFileKey))).toBe(true);
-    expect(countJobCandidates(company.id, other.id)).toBe(1);
+    expect(await jobRow(job.id)).toBeUndefined();
+    expect(await db.select().from(candidates).where(eq(candidates.jobId, job.id))).toEqual([]);
+    expect(await cvFileExists(c1.cvFileKey)).toBe(false);
+    expect(await cvFileExists(c2.cvFileKey)).toBe(false);
+    expect(await cvFileExists(kept.cvFileKey)).toBe(true);
+    expect(await countJobCandidates(company.id, other.id)).toBe(1);
   });
 
   it("cannot delete another company's job or touch its files", async () => {
-    const a = makeCompany();
-    const b = makeCompany();
-    const job = createJob(a.company.id, parse());
+    const a = await makeCompany();
+    const b = await makeCompany();
+    const job = await createJob(a.company.id, parse());
     const c = await createCandidateFromCv({ job, source: "upload", cv: pdfCv() });
 
     expect(await deleteJob(b.company.id, job.id)).toBe(false);
     expect(await deleteJob(a.company.id, "missing-id")).toBe(false);
-    expect(countJobCandidates(b.company.id, job.id)).toBe(0);
-    expect(countJobCandidates(a.company.id, job.id)).toBe(1);
-    expect(fs.existsSync(cvPath(c.cvFileKey))).toBe(true);
+    expect(await countJobCandidates(b.company.id, job.id)).toBe(0);
+    expect(await countJobCandidates(a.company.id, job.id)).toBe(1);
+    expect(await cvFileExists(c.cvFileKey)).toBe(true);
   });
 });

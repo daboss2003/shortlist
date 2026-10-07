@@ -26,14 +26,14 @@ export function inviteUrl(token: string): string {
 
 export type CreatedInvite = { id: string; token: string; url: string; email: string | null; expiresAt: Date };
 
-export function createInvite({
+export async function createInvite({
   email,
   days = DEFAULT_INVITE_DAYS,
   createdByUserId,
-}: { email?: string | null; days?: number; createdByUserId?: string | null } = {}): CreatedInvite {
+}: { email?: string | null; days?: number; createdByUserId?: string | null } = {}): Promise<CreatedInvite> {
   if (!Number.isFinite(days) || days <= 0) throw new Error("Invite validity must be a positive number of days");
   const token = randomBytes(32).toString("base64url");
-  const invite = db
+  const [invite] = await db
     .insert(invites)
     .values({
       tokenHash: hashInviteToken(token),
@@ -41,8 +41,7 @@ export function createInvite({
       expiresAt: new Date(Date.now() + days * DAY_MS),
       createdByUserId: createdByUserId ?? null,
     })
-    .returning()
-    .get();
+    .returning();
   return { id: invite.id, token, url: inviteUrl(token), email: invite.email, expiresAt: invite.expiresAt };
 }
 
@@ -58,9 +57,10 @@ function usableInviteWhere(token: string, now: Date, email?: string): SQL {
 }
 
 /** The invite if it exists and is unused, unrevoked and unexpired; else null. Doesn't check the email. */
-export function findUsableInvite(token: unknown, now: Date = new Date()): Invite | null {
+export async function findUsableInvite(token: unknown, now: Date = new Date()): Promise<Invite | null> {
   if (!isWellFormedToken(token)) return null;
-  return db.select().from(invites).where(usableInviteWhere(token, now)).get() ?? null;
+  const [invite] = await db.select().from(invites).where(usableInviteWhere(token, now)).limit(1);
+  return invite ?? null;
 }
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -69,14 +69,22 @@ type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
  * Marks the invite used by `userId`, atomically re-checking that it is still usable and (if bound to an
  * email) for `email`. Call inside the signup transaction; false means it must roll back.
  */
-export function redeemInvite(tx: Tx, token: unknown, userId: string, email: string, now: Date = new Date()): boolean {
+export async function redeemInvite(
+  tx: Tx,
+  token: unknown,
+  userId: string,
+  email: string,
+  now: Date = new Date(),
+): Promise<boolean> {
   if (!isWellFormedToken(token)) return false;
-  const { changes } = tx
+  // One conditional UPDATE: a concurrent redemption of the same link waits on the row lock, then re-checks
+  // `used_at IS NULL` against the committed row and updates nothing.
+  const redeemed = await tx
     .update(invites)
     .set({ usedAt: now, usedByUserId: userId })
     .where(usableInviteWhere(token, now, email))
-    .run();
-  return changes === 1;
+    .returning({ id: invites.id });
+  return redeemed.length === 1;
 }
 
 export const INVITE_STATUSES = ["pending", "used", "expired", "revoked"] as const;
@@ -105,8 +113,8 @@ export function inviteStatus(
 }
 
 /** Every invite, newest first. Platform-admin only — callers must check. */
-export function listInvites(now: Date = new Date()): InviteListItem[] {
-  return db
+export async function listInvites(now: Date = new Date()): Promise<InviteListItem[]> {
+  const rows = await db
     .select({
       id: invites.id,
       email: invites.email,
@@ -119,18 +127,16 @@ export function listInvites(now: Date = new Date()): InviteListItem[] {
     .from(invites)
     .leftJoin(users, eq(users.id, invites.usedByUserId))
     .leftJoin(companies, eq(companies.id, users.companyId))
-    .orderBy(desc(invites.createdAt), desc(invites.id))
-    .all()
-    .map((row) => ({ ...row, status: inviteStatus(row, now) }));
+    .orderBy(desc(invites.createdAt), desc(invites.id));
+  return rows.map((row) => ({ ...row, status: inviteStatus(row, now) }));
 }
 
 /** Revokes an unused, unrevoked invite. Returns false if there was nothing to revoke. */
-export function revokeInvite(id: string, now: Date = new Date()): boolean {
-  return (
-    db
-      .update(invites)
-      .set({ revokedAt: now })
-      .where(and(eq(invites.id, id), isNull(invites.usedAt), isNull(invites.revokedAt)))
-      .run().changes === 1
-  );
+export async function revokeInvite(id: string, now: Date = new Date()): Promise<boolean> {
+  const revoked = await db
+    .update(invites)
+    .set({ revokedAt: now })
+    .where(and(eq(invites.id, id), isNull(invites.usedAt), isNull(invites.revokedAt)))
+    .returning({ id: invites.id });
+  return revoked.length === 1;
 }

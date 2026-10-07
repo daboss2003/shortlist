@@ -5,13 +5,15 @@
 //   pnpm invite jane@acme.com --days 7
 // Plain ESM with no app imports so it runs without a build. Mirrors createInvite in src/lib/auth/invites.ts:
 // keep the token format, hashing and columns in step with it.
+//
+// Database: Neon when DATABASE_URL is set (run `pnpm db:migrate` first); otherwise the local embedded PGlite at
+// PGLITE_DIR (default ./data/pglite), migrated here first. PGlite is single-process, so this refuses to run while the
+// app holds the local database (see the .app.lock written by src/db/index.ts).
 
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import Database from "better-sqlite3";
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import { migrate } from "drizzle-orm/better-sqlite3/migrator";
+import { sql } from "drizzle-orm";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const USAGE = "Usage: pnpm invite [email] [--days N]";
@@ -59,25 +61,65 @@ function parseArgs(argv) {
 
 const { email, days } = parseArgs(process.argv.slice(2));
 
-const file = process.env.DATABASE_PATH || "./data/app.db";
-if (file !== ":memory:") fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
-const sqlite = new Database(file);
-sqlite.pragma("journal_mode = WAL");
-sqlite.pragma("foreign_keys = ON");
-sqlite.pragma("busy_timeout = 5000");
-migrate(drizzle(sqlite), { migrationsFolder: path.resolve("drizzle") });
+/** Refuses to touch the local PGlite database while the app (pnpm dev / start) holds it — the write would be lost. */
+function assertLocalDbFree(dir) {
+  let pid;
+  try {
+    pid = Number(fs.readFileSync(path.join(dir, ".app.lock"), "utf8"));
+  } catch {
+    return; // no lock: the app isn't running against this database
+  }
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return;
+  try {
+    process.kill(pid, 0); // throws if that process no longer exists (stale lock)
+  } catch {
+    return;
+  }
+  console.error("The app is running against the local database (pid " + pid + "), which can't be shared between processes.");
+  console.error("Create the invite from Dashboard → Invites while signed in as the admin, or stop the app and run this again.");
+  process.exit(1);
+}
+
+/** Opens the database: { db, close }. Imports lazily so only the driver in use is loaded. */
+async function openDatabase() {
+  const url = process.env.DATABASE_URL;
+  if (url) {
+    const { Pool } = await import("@neondatabase/serverless");
+    const { drizzle } = await import("drizzle-orm/neon-serverless");
+    const pool = new Pool({ connectionString: url });
+    return { db: drizzle({ client: pool }), close: () => pool.end() };
+  }
+  const { PGlite } = await import("@electric-sql/pglite");
+  const { drizzle } = await import("drizzle-orm/pglite");
+  const { migrate } = await import("drizzle-orm/pglite/migrator");
+  const dir = process.env.PGLITE_DIR || "./data/pglite";
+  if (dir !== "memory://") {
+    assertLocalDbFree(path.resolve(dir));
+    fs.mkdirSync(path.resolve(dir), { recursive: true });
+  }
+  const client = new PGlite(dir === "memory://" ? undefined : path.resolve(dir));
+  const db = drizzle({ client });
+  await migrate(db, { migrationsFolder: path.resolve("drizzle") });
+  return { db, close: () => client.close() };
+}
 
 const token = randomBytes(32).toString("base64url");
-const now = Date.now();
-const expiresAt = now + days * DAY_MS;
-sqlite
-  .prepare("INSERT INTO invites (id, token_hash, email, expires_at, created_at) VALUES (?, ?, ?, ?, ?)")
-  .run(randomUUID(), createHash("sha256").update(token).digest("hex"), email, expiresAt, now);
-sqlite.close();
+const now = new Date();
+const expiresAt = new Date(now.getTime() + days * DAY_MS);
+const { db, close } = await openDatabase();
+try {
+  await db.execute(
+    sql`INSERT INTO invites (id, token_hash, email, expires_at, created_at)
+        VALUES (${randomUUID()}, ${createHash("sha256").update(token).digest("hex")}, ${email},
+                ${expiresAt.toISOString()}::timestamptz, ${now.toISOString()}::timestamptz)`,
+  );
+} finally {
+  await close();
+}
 
 const base = (process.env.APP_URL || "http://localhost:3000").replace(/\/+$/, "");
 console.log(`Invite created${email ? ` for ${email}` : " (anyone with the link)"}, valid for ${days} day${days === 1 ? "" : "s"}.`);
-console.log(`Expires: ${new Date(expiresAt).toISOString()}`);
+console.log(`Expires: ${expiresAt.toISOString()}`);
 console.log("");
 console.log(`${base}/signup?invite=${token}`);
 console.log("");

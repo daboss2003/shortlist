@@ -43,11 +43,11 @@ export async function createInviteAction(_prev: CreateInviteState, formData: For
     return { fieldErrors: { email: fieldErrors.email?.[0], days: fieldErrors.days?.[0] }, values };
   }
   const { email, days } = parsed.data;
-  if (email && accountExists(email)) {
+  if (email && (await accountExists(email))) {
     return { fieldErrors: { email: "An account with this email already exists." }, values };
   }
 
-  const invite = createInvite({ email: email || null, days, createdByUserId: admin.userId });
+  const invite = await createInvite({ email: email || null, days, createdByUserId: admin.userId });
   revalidatePath("/dashboard/admin/invites");
   return { created: { url: invite.url, email: invite.email, expiresAt: invite.expiresAt.toISOString() } };
 }
@@ -56,6 +56,6 @@ export async function revokeInviteAction(inviteId: string): Promise<void> {
   await requirePlatformAdmin();
   const id = z.uuid().safeParse(inviteId);
   // Already used, revoked or gone (e.g. from another tab): nothing to do; the refreshed table shows its status.
-  if (id.success) revokeInvite(id.data);
+  if (id.success) await revokeInvite(id.data);
   revalidatePath("/dashboard/admin/invites");
 }

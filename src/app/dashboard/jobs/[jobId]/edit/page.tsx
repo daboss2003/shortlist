@@ -23,9 +23,9 @@ export default function EditJobPage(props: PageProps<"/dashboard/jobs/[jobId]/ed
 async function EditJob({ params }: PageProps<"/dashboard/jobs/[jobId]/edit">) {
   const { companyId } = await requireEmployer();
   const { jobId } = await params;
-  const job = getJobForCompany(companyId, jobId);
+  const job = await getJobForCompany(companyId, jobId);
   if (!job) notFound();
-  const candidateCount = countJobCandidates(companyId, job.id);
+  const candidateCount = await countJobCandidates(companyId, job.id);
   const jobHref = `/dashboard/jobs/${job.id}`;
 
   return (

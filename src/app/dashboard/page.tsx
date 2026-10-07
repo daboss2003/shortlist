@@ -36,9 +36,8 @@ export default function JobsPage() {
 
 async function JobsContent() {
   const { companyId, isPlatformAdmin } = await requireEmployer();
-  const jobs = listJobsWithStats(companyId);
+  const [jobs, quota] = await Promise.all([listJobsWithStats(companyId), getAiQuota(companyId)]);
   const ai = getAiStatus();
-  const quota = getAiQuota(companyId);
 
   return (
     <div className="space-y-6">

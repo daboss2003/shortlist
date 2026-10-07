@@ -30,7 +30,7 @@ export async function updateCompanyProfileAction(
 ): Promise<CompanyProfileState> {
   const { companyId } = await requireEmployer();
   const values = { name: text(formData, "name"), website: text(formData, "website") };
-  const result = updateCompanyProfile(companyId, values);
+  const result = await updateCompanyProfile(companyId, values);
   if (!result.ok) return { fieldErrors: result.fieldErrors, values };
 
   // The company name is in the dashboard header; name and website are on every public job page.
@@ -50,7 +50,7 @@ export async function updateRetentionAction(_prev: RetentionState, formData: For
   const parsed = retentionSchema.safeParse(formData.get("retentionDays"));
   if (!parsed.success) return { error: "Choose a retention period from the list." };
 
-  setRetentionDays(companyId, parsed.data);
+  await setRetentionDays(companyId, parsed.data);
   revalidatePath("/dashboard", "layout");
   return { ok: true };
 }

@@ -5,7 +5,7 @@ import { users } from "@/db/schema";
 import { authenticate } from "@/lib/auth/accounts";
 import { createInvite } from "@/lib/auth/invites";
 import { hashPassword } from "@/lib/auth/password";
-import { hit, peek, rateLimit, resetRateLimits } from "@/lib/rate-limit";
+import { hit, peek, rateLimit, refund, resetRateLimits } from "@/lib/rate-limit";
 import { makeCompany } from "../../../test/factories";
 
 const mocks = vi.hoisted(() => ({ xff: "203.0.113.1" }));
@@ -45,19 +45,20 @@ const login = (email: string, password: string, ip = "203.0.113.1") => {
 const LOGGED_IN = { redirected: "REDIRECT:/dashboard" };
 
 async function makeUser() {
-  const { user } = makeCompany();
-  db.update(users).set({ passwordHash: await hashPassword(PASSWORD) }).where(eq(users.id, user.id)).run();
+  const { user } = await makeCompany();
+  await db.update(users).set({ passwordHash: await hashPassword(PASSWORD) }).where(eq(users.id, user.id));
   return user;
 }
 
 /** Real password checks cost ~50 ms; bulk failure tests swap in an instant "wrong password". */
 const fastFailures = () => vi.mocked(authenticate).mockResolvedValue(null);
 
-beforeEach(() => {
-  resetRateLimits();
+beforeEach(async () => {
+  await resetRateLimits();
   vi.mocked(authenticate).mockReset();
   vi.mocked(hit).mockClear();
   vi.mocked(peek).mockClear();
+  vi.mocked(refund).mockClear();
   vi.mocked(rateLimit).mockClear();
 });
 
@@ -122,6 +123,23 @@ describe("loginAction", () => {
     const results = await Promise.all(Array.from({ length: 25 }, () => login(user.email, "wrong")));
     expect(authenticate).toHaveBeenCalledTimes(10);
     expect(results.filter((r) => "error" in r && r.error === TOO_MANY.error)).toHaveLength(15);
+    // Refused attempts took their hits back: exactly the 10 real failures are counted, so the owner is still
+    // blocked from this IP but only 10 count against the email from anywhere.
+    vi.mocked(authenticate).mockReset();
+    expect(await login(user.email, PASSWORD)).toEqual({ ...TOO_MANY, email: user.email });
+    expect((await peek(`login-email:${user.email}`, 11)).ok).toBe(true);
+    expect((await peek(`login-email:${user.email}`, 10)).ok).toBe(false);
+  });
+
+  it("refunds every counter on a successful login", async () => {
+    const user = await makeUser();
+    expect(await login(user.email, PASSWORD)).toEqual(LOGGED_IN);
+    expect(vi.mocked(refund).mock.calls.map(([key]) => key).sort()).toEqual(
+      [`login-email:${user.email}`, `login-ip:203.0.113.1`, `login:${user.email}|203.0.113.1`].sort(),
+    );
+    for (const key of [`login-email:${user.email}`, "login-ip:203.0.113.1", `login:${user.email}|203.0.113.1`]) {
+      expect((await peek(key, 1)).ok).toBe(true);
+    }
   });
 
   it("keys the IP on the trusted proxy entry, so spoofed X-Forwarded-For values don't reset the count", async () => {
@@ -133,14 +151,14 @@ describe("loginAction", () => {
 });
 
 describe("signupAction", () => {
-  const signupForm = (overrides: Record<string, string> = {}) =>
+  const signupForm = async (overrides: Record<string, string> = {}) =>
     form({
       companyName: "Acme Logistics",
       website: "",
       name: "Jane Doe",
       email: `jane.${crypto.randomUUID()}@acme.com`,
       password: PASSWORD,
-      invite: createInvite().token,
+      invite: (await createInvite()).token,
       ...overrides,
     });
   const signup = (fd: FormData, xff = "203.0.113.50") => {
@@ -149,11 +167,11 @@ describe("signupAction", () => {
   };
 
   it("creates the account with a valid invite and signs in", async () => {
-    expect(await signup(signupForm())).toEqual(LOGGED_IN);
+    expect(await signup(await signupForm())).toEqual(LOGGED_IN);
   });
 
   it("shows the generic invite error, echoing what was typed except the password", async () => {
-    const result = await signup(signupForm({ invite: "", email: "jane@acme.com" }));
+    const result = await signup(await signupForm({ invite: "", email: "jane@acme.com" }));
     expect(result).toEqual({
       fieldErrors: {},
       formError: "This invite link is invalid or has expired. Ask for a new one.",
@@ -162,10 +180,10 @@ describe("signupAction", () => {
   });
 
   it("limits signups per trusted IP, ignoring spoofed X-Forwarded-For entries", async () => {
-    for (let i = 0; i < 10; i++) await signup(signupForm({ invite: "" }), `192.0.2.${i}, 203.0.113.60`);
-    expect(await signup(signupForm(), "192.0.2.77, 203.0.113.60")).toMatchObject({
+    for (let i = 0; i < 10; i++) await signup(await signupForm({ invite: "" }), `192.0.2.${i}, 203.0.113.60`);
+    expect(await signup(await signupForm(), "192.0.2.77, 203.0.113.60")).toMatchObject({
       formError: "Too many attempts. Try again in a few minutes.",
     });
-    expect(await signup(signupForm(), "203.0.113.61")).toEqual(LOGGED_IN);
+    expect(await signup(await signupForm(), "203.0.113.61")).toEqual(LOGGED_IN);
   });
 });

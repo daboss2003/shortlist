@@ -27,7 +27,7 @@ async function SignupContent({ searchParams }: Pick<PageProps<"/signup">, "searc
   if (await getCurrentEmployer()) redirect("/dashboard");
   const { invite: raw } = await searchParams;
   const token = typeof raw === "string" ? raw : undefined;
-  const invite = token ? findUsableInvite(token) : null;
+  const invite = token ? await findUsableInvite(token) : null;
 
   if (!token || !invite) {
     return (

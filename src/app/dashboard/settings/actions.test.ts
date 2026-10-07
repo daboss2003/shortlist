@@ -22,10 +22,10 @@ const form = (fields: Record<string, string>) => {
   for (const [k, v] of Object.entries(fields)) fd.set(k, v);
   return fd;
 };
-const companyRow = (id: string) => db.select().from(companies).where(eq(companies.id, id)).get()!;
+const companyRow = async (id: string) => (await db.select().from(companies).where(eq(companies.id, id)))[0];
 
-function signIn() {
-  const { company, user } = makeCompany("Before Co");
+async function signIn() {
+  const { company, user } = await makeCompany("Before Co");
   mocks.employer = {
     userId: user.id,
     name: user.name,
@@ -49,24 +49,24 @@ describe("updateCompanyProfileAction", () => {
   });
 
   it("saves the signed-in company's profile and echoes the normalized values", async () => {
-    const company = signIn();
-    const other = makeCompany("Other Co").company;
+    const company = await signIn();
+    const other = (await makeCompany("Other Co")).company;
     const state = await updateCompanyProfileAction({}, form({ name: " Initech ", website: "initech.com" }));
     expect(state).toEqual({ ok: true, values: { name: "Initech", website: "https://initech.com" } });
-    expect(companyRow(company.id)).toMatchObject({ name: "Initech", website: "https://initech.com" });
-    expect(companyRow(other.id).name).toBe("Other Co");
+    expect(await companyRow(company.id)).toMatchObject({ name: "Initech", website: "https://initech.com" });
+    expect((await companyRow(other.id)).name).toBe("Other Co");
     expect(mocks.revalidatePath).toHaveBeenCalledWith("/dashboard", "layout");
     expect(mocks.revalidatePath).toHaveBeenCalledWith("/apply/[slug]", "page");
   });
 
   it("returns field errors and keeps what was typed", async () => {
-    const company = signIn();
+    const company = await signIn();
     const state = await updateCompanyProfileAction({}, form({ name: "A", website: "ftp://x.com" }));
     expect(state).toMatchObject({
       fieldErrors: { name: expect.any(String), website: expect.any(String) },
       values: { name: "A", website: "ftp://x.com" },
     });
-    expect(companyRow(company.id).name).toBe("Before Co");
+    expect((await companyRow(company.id)).name).toBe("Before Co");
     expect(mocks.revalidatePath).not.toHaveBeenCalled();
   });
 });
@@ -77,21 +77,21 @@ describe("updateRetentionAction", () => {
   });
 
   it("saves an offered period, or Off", async () => {
-    const company = signIn();
+    const company = await signIn();
     expect(await updateRetentionAction({}, form({ retentionDays: "180" }))).toEqual({ ok: true });
-    expect(companyRow(company.id).retentionDays).toBe(180);
+    expect((await companyRow(company.id)).retentionDays).toBe(180);
     expect(await updateRetentionAction({}, form({ retentionDays: "off" }))).toEqual({ ok: true });
-    expect(companyRow(company.id).retentionDays).toBeNull();
+    expect((await companyRow(company.id)).retentionDays).toBeNull();
   });
 
   it("rejects anything else without writing", async () => {
-    const company = signIn();
+    const company = await signIn();
     for (const value of ["", "0", "1", "365", "90abc", "null", "-30"]) {
       expect(await updateRetentionAction({}, form({ retentionDays: value }))).toEqual({
         error: "Choose a retention period from the list.",
       });
     }
     expect(await updateRetentionAction({}, new FormData())).toMatchObject({ error: expect.any(String) });
-    expect(companyRow(company.id).retentionDays).toBe(90);
+    expect((await companyRow(company.id)).retentionDays).toBe(90);
   });
 });

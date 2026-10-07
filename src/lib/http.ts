@@ -30,10 +30,15 @@ const MAX_IP_LENGTH = 64;
 
 /**
  * The client IP as seen by the nearest trusted proxy, for per-IP rate limits.
- * Each proxy appends the address it received the request from, so only the entries the trusted proxies
- * added (counted from the right) are reliable; anything to their left was sent by the client and is spoofable.
+ * On Netlify, its edge sets (and overwrites any client-sent) x-nf-client-connection-ip, so that is used.
+ * Elsewhere each proxy appends the address it received the request from to X-Forwarded-For, so only the entries
+ * the trusted proxies added (counted from the right) are reliable; anything to their left is spoofable.
  */
 export function clientIpFromHeaders(headers: Pick<Headers, "get">): string {
+  // Only trusted when actually running on Netlify; behind any other proxy a client could send this header itself.
+  const netlifyIp = process.env.NETLIFY === "true" ? headers.get("x-nf-client-connection-ip")?.trim() : undefined;
+  if (netlifyIp) return netlifyIp.slice(0, MAX_IP_LENGTH);
+
   const entries = (headers.get("x-forwarded-for") ?? "")
     .split(",")
     .map((entry) => entry.trim())

@@ -24,10 +24,10 @@ vi.mock("next/navigation", () => ({
 
 const { getCurrentEmployer, requireEmployer, requirePlatformAdmin } = await import("./dal");
 
-function signIn(admin: boolean) {
-  const { company, user } = makeCompany();
-  if (admin) db.update(users).set({ isPlatformAdmin: true }).where(eq(users.id, user.id)).run();
-  mocks.token = insertSession(user.id).token;
+async function signIn(admin: boolean) {
+  const { company, user } = await makeCompany();
+  if (admin) await db.update(users).set({ isPlatformAdmin: true }).where(eq(users.id, user.id));
+  mocks.token = (await insertSession(user.id)).token;
   return { company, user };
 }
 
@@ -48,7 +48,7 @@ describe("requireEmployer", () => {
   });
 
   it("returns the employer with the admin flag", async () => {
-    const { company } = signIn(false);
+    const { company } = await signIn(false);
     expect(await requireEmployer()).toMatchObject({ companyId: company.id, isPlatformAdmin: false });
   });
 });
@@ -59,12 +59,12 @@ describe("requirePlatformAdmin", () => {
   });
 
   it("404s for a signed-in non-admin", async () => {
-    signIn(false);
+    await signIn(false);
     await expect(requirePlatformAdmin()).rejects.toThrow("NOT_FOUND");
   });
 
   it("returns the admin", async () => {
-    const { user } = signIn(true);
+    const { user } = await signIn(true);
     expect(await requirePlatformAdmin()).toMatchObject({ userId: user.id, isPlatformAdmin: true });
   });
 });

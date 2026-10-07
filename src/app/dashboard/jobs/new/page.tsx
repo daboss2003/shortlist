@@ -26,12 +26,13 @@ export default function NewJobPage() {
 
 async function NewJobForm() {
   const { companyId } = await requireEmployer();
+  const newestId = await newestJobId(companyId);
   return (
     <JobForm
       // Intentional: a fresh form after each job is created. Cache Components keeps this page mounted (React
       // Activity), so the last attempt's errors and echoed values would otherwise greet the next visit. Keyed on
       // the newest job rather than per request so an unsaved draft survives navigating away and back.
-      key={newestJobId(companyId) ?? "first"}
+      key={newestId ?? "first"}
       action={createJobAction}
       submitLabel="Create job"
       pendingLabel="Creating…"

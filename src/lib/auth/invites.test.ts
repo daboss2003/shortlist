@@ -15,7 +15,7 @@ import {
 } from "./invites";
 
 const DAY = 24 * 60 * 60 * 1000;
-const row = (id: string) => db.select().from(invites).where(eq(invites.id, id)).get()!;
+const row = async (id: string) => (await db.select().from(invites).where(eq(invites.id, id)))[0];
 const redeem = (token: string, userId: string, email: string, now?: Date) =>
   db.transaction((tx) => redeemInvite(tx, token, userId, email, now));
 
@@ -24,138 +24,148 @@ afterEach(() => {
 });
 
 describe("createInvite", () => {
-  it("returns a 32-byte base64url token and stores only its sha256", () => {
-    const invite = createInvite();
+  it("returns a 32-byte base64url token and stores only its sha256", async () => {
+    const invite = await createInvite();
     expect(invite.token).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(Buffer.from(invite.token, "base64url")).toHaveLength(32);
 
-    const stored = row(invite.id);
+    const stored = await row(invite.id);
     expect(stored.tokenHash).toBe(createHash("sha256").update(invite.token).digest("hex"));
     expect(JSON.stringify(stored)).not.toContain(invite.token);
     expect(stored).toMatchObject({ email: null, usedAt: null, revokedAt: null, createdByUserId: null });
   });
 
-  it("builds the signup URL from APP_URL, defaulting to localhost", () => {
+  it("builds the signup URL from APP_URL, defaulting to localhost", async () => {
     vi.stubEnv("APP_URL", "");
-    const local = createInvite();
+    const local = await createInvite();
     expect(local.url).toBe(`http://localhost:3000/signup?invite=${local.token}`);
 
     vi.stubEnv("APP_URL", "https://hire.example.com/");
-    const prod = createInvite();
+    const prod = await createInvite();
     expect(prod.url).toBe(`https://hire.example.com/signup?invite=${prod.token}`);
   });
 
-  it("expires after 14 days by default, or the given number of days", () => {
+  it("expires after 14 days by default, or the given number of days", async () => {
     const before = Date.now();
-    expect(createInvite().expiresAt.getTime()).toBeGreaterThanOrEqual(before + 14 * DAY);
-    expect(createInvite().expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 14 * DAY);
-    expect(createInvite({ days: 7 }).expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 7 * DAY);
-    expect(() => createInvite({ days: 0 })).toThrow();
-    expect(() => createInvite({ days: Number.NaN })).toThrow();
+    expect((await createInvite()).expiresAt.getTime()).toBeGreaterThanOrEqual(before + 14 * DAY);
+    expect((await createInvite()).expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 14 * DAY);
+    expect((await createInvite({ days: 7 })).expiresAt.getTime()).toBeLessThanOrEqual(Date.now() + 7 * DAY);
+    await expect(createInvite({ days: 0 })).rejects.toThrow();
+    await expect(createInvite({ days: Number.NaN })).rejects.toThrow();
   });
 
-  it("lowercases the email, and records who created it", () => {
-    const { user } = makeCompany();
-    const invite = createInvite({ email: "  Jane@Acme.COM ", createdByUserId: user.id });
-    expect(row(invite.id)).toMatchObject({ email: "jane@acme.com", createdByUserId: user.id });
+  it("lowercases the email, and records who created it", async () => {
+    const { user } = await makeCompany();
+    const invite = await createInvite({ email: "  Jane@Acme.COM ", createdByUserId: user.id });
+    expect(await row(invite.id)).toMatchObject({ email: "jane@acme.com", createdByUserId: user.id });
     expect(invite.email).toBe("jane@acme.com");
   });
 
-  it("makes a new token every time", () => {
-    expect(createInvite().token).not.toBe(createInvite().token);
+  it("makes a new token every time", async () => {
+    expect((await createInvite()).token).not.toBe((await createInvite()).token);
   });
 });
 
 describe("findUsableInvite", () => {
-  it("finds an unused, unexpired invite by its raw token", () => {
-    const invite = createInvite({ email: "a@b.co" });
-    expect(findUsableInvite(invite.token)).toMatchObject({ id: invite.id, email: "a@b.co" });
+  it("finds an unused, unexpired invite by its raw token", async () => {
+    const invite = await createInvite({ email: "a@b.co" });
+    expect(await findUsableInvite(invite.token)).toMatchObject({ id: invite.id, email: "a@b.co" });
   });
 
-  it("returns null for unknown, malformed, expired, used and revoked invites", () => {
-    expect(findUsableInvite(undefined)).toBeNull();
-    expect(findUsableInvite("")).toBeNull();
-    expect(findUsableInvite("x".repeat(10_000))).toBeNull();
-    expect(findUsableInvite("A".repeat(43))).toBeNull();
+  it("returns null for unknown, malformed, expired, used and revoked invites", async () => {
+    expect(await findUsableInvite(undefined)).toBeNull();
+    expect(await findUsableInvite("")).toBeNull();
+    expect(await findUsableInvite("x".repeat(10_000))).toBeNull();
+    expect(await findUsableInvite("A".repeat(43))).toBeNull();
 
-    const expired = createInvite({ days: 1 });
-    expect(findUsableInvite(expired.token, new Date(Date.now() + 2 * DAY))).toBeNull();
+    const expired = await createInvite({ days: 1 });
+    expect(await findUsableInvite(expired.token, new Date(Date.now() + 2 * DAY))).toBeNull();
 
-    const { user } = makeCompany();
-    const used = createInvite();
-    expect(redeem(used.token, user.id, user.email)).toBe(true);
-    expect(findUsableInvite(used.token)).toBeNull();
+    const { user } = await makeCompany();
+    const used = await createInvite();
+    expect(await redeem(used.token, user.id, user.email)).toBe(true);
+    expect(await findUsableInvite(used.token)).toBeNull();
 
-    const revoked = createInvite();
-    revokeInvite(revoked.id);
-    expect(findUsableInvite(revoked.token)).toBeNull();
+    const revoked = await createInvite();
+    await revokeInvite(revoked.id);
+    expect(await findUsableInvite(revoked.token)).toBeNull();
   });
 
-  it("doesn't match on the hash itself", () => {
-    const invite = createInvite();
-    expect(findUsableInvite(hashInviteToken(invite.token))).toBeNull();
+  it("doesn't match on the hash itself", async () => {
+    const invite = await createInvite();
+    expect(await findUsableInvite(hashInviteToken(invite.token))).toBeNull();
   });
 });
 
 describe("redeemInvite", () => {
-  it("works once", () => {
-    const { user } = makeCompany();
-    const invite = createInvite();
-    expect(redeem(invite.token, user.id, user.email)).toBe(true);
-    expect(row(invite.id)).toMatchObject({ usedByUserId: user.id });
-    expect(redeem(invite.token, user.id, user.email)).toBe(false);
+  it("works once", async () => {
+    const { user } = await makeCompany();
+    const invite = await createInvite();
+    expect(await redeem(invite.token, user.id, user.email)).toBe(true);
+    expect(await row(invite.id)).toMatchObject({ usedByUserId: user.id });
+    expect(await redeem(invite.token, user.id, user.email)).toBe(false);
   });
 
-  it("refuses an expired, revoked or other-email invite", () => {
-    const { user } = makeCompany();
-    const expired = createInvite({ days: 1 });
-    expect(redeem(expired.token, user.id, user.email, new Date(Date.now() + 2 * DAY))).toBe(false);
+  it("lets only one of two parallel redemptions win", async () => {
+    const { user } = await makeCompany();
+    const invite = await createInvite();
+    const results = await Promise.all([
+      redeem(invite.token, user.id, user.email),
+      redeem(invite.token, user.id, user.email),
+    ]);
+    expect(results.sort()).toEqual([false, true]);
+  });
 
-    const revoked = createInvite();
-    revokeInvite(revoked.id);
-    expect(redeem(revoked.token, user.id, user.email)).toBe(false);
+  it("refuses an expired, revoked or other-email invite", async () => {
+    const { user } = await makeCompany();
+    const expired = await createInvite({ days: 1 });
+    expect(await redeem(expired.token, user.id, user.email, new Date(Date.now() + 2 * DAY))).toBe(false);
 
-    const bound = createInvite({ email: "invited@acme.com" });
-    expect(redeem(bound.token, user.id, "other@acme.com")).toBe(false);
-    expect(redeem(bound.token, user.id, "invited@acme.com")).toBe(true);
+    const revoked = await createInvite();
+    await revokeInvite(revoked.id);
+    expect(await redeem(revoked.token, user.id, user.email)).toBe(false);
 
-    expect(row(expired.id).usedAt).toBeNull();
-    expect(row(revoked.id).usedAt).toBeNull();
+    const bound = await createInvite({ email: "invited@acme.com" });
+    expect(await redeem(bound.token, user.id, "other@acme.com")).toBe(false);
+    expect(await redeem(bound.token, user.id, "invited@acme.com")).toBe(true);
+
+    expect((await row(expired.id)).usedAt).toBeNull();
+    expect((await row(revoked.id)).usedAt).toBeNull();
   });
 });
 
 describe("revokeInvite", () => {
-  it("revokes a pending invite once", () => {
-    const invite = createInvite();
-    expect(revokeInvite(invite.id)).toBe(true);
-    expect(row(invite.id).revokedAt).toBeInstanceOf(Date);
-    expect(revokeInvite(invite.id)).toBe(false);
+  it("revokes a pending invite once", async () => {
+    const invite = await createInvite();
+    expect(await revokeInvite(invite.id)).toBe(true);
+    expect((await row(invite.id)).revokedAt).toBeInstanceOf(Date);
+    expect(await revokeInvite(invite.id)).toBe(false);
   });
 
-  it("can't revoke a used invite or a missing one", () => {
-    const { user } = makeCompany();
-    const invite = createInvite();
-    redeem(invite.token, user.id, user.email);
-    expect(revokeInvite(invite.id)).toBe(false);
-    expect(row(invite.id).revokedAt).toBeNull();
-    expect(revokeInvite(crypto.randomUUID())).toBe(false);
+  it("can't revoke a used invite or a missing one", async () => {
+    const { user } = await makeCompany();
+    const invite = await createInvite();
+    await redeem(invite.token, user.id, user.email);
+    expect(await revokeInvite(invite.id)).toBe(false);
+    expect((await row(invite.id)).revokedAt).toBeNull();
+    expect(await revokeInvite(crypto.randomUUID())).toBe(false);
   });
 });
 
 describe("listInvites", () => {
-  it("lists every invite newest first with its status and the redeeming company", () => {
+  it("lists every invite newest first with its status and the redeeming company", async () => {
     const now = new Date();
-    const { company, user } = makeCompany("Globex Hiring");
+    const { company, user } = await makeCompany("Globex Hiring");
 
-    const pending = createInvite({ email: "p@acme.com" });
-    const used = createInvite();
-    redeem(used.token, user.id, user.email);
-    const revoked = createInvite();
-    revokeInvite(revoked.id);
-    const expired = createInvite({ days: 1 });
-    db.update(invites).set({ expiresAt: new Date(now.getTime() - 1000) }).where(eq(invites.id, expired.id)).run();
+    const pending = await createInvite({ email: "p@acme.com" });
+    const used = await createInvite();
+    await redeem(used.token, user.id, user.email);
+    const revoked = await createInvite();
+    await revokeInvite(revoked.id);
+    const expired = await createInvite({ days: 1 });
+    await db.update(invites).set({ expiresAt: new Date(now.getTime() - 1000) }).where(eq(invites.id, expired.id));
 
-    const list = listInvites(now);
+    const list = await listInvites(now);
     const byId = Object.fromEntries(list.map((i) => [i.id, i]));
     expect(byId[pending.id]).toMatchObject({ status: "pending", email: "p@acme.com", usedByCompanyName: null });
     expect(byId[used.id]).toMatchObject({ status: "used", usedByCompanyName: company.name });
@@ -167,12 +177,12 @@ describe("listInvites", () => {
     expect(JSON.stringify(list)).not.toMatch(/tokenHash|token_hash/);
   });
 
-  it("still shows a used invite as used after the account is deleted", () => {
-    const { user } = makeCompany();
-    const invite = createInvite();
-    redeem(invite.token, user.id, user.email);
-    db.delete(users).where(eq(users.id, user.id)).run();
-    expect(listInvites().find((i) => i.id === invite.id)).toMatchObject({ status: "used", usedByCompanyName: null });
+  it("still shows a used invite as used after the account is deleted", async () => {
+    const { user } = await makeCompany();
+    const invite = await createInvite();
+    await redeem(invite.token, user.id, user.email);
+    await db.delete(users).where(eq(users.id, user.id));
+    expect((await listInvites()).find((i) => i.id === invite.id)).toMatchObject({ status: "used", usedByCompanyName: null });
   });
 });
 

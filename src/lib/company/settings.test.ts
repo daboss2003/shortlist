@@ -6,80 +6,80 @@ import { getCompanyRetentionDays } from "@/lib/retention";
 import { makeCompany } from "../../../test/factories";
 import { getCompanySettings, isRetentionDays, setRetentionDays, updateCompanyProfile } from "./settings";
 
-const companyRow = (id: string) => db.select().from(companies).where(eq(companies.id, id)).get()!;
+const companyRow = async (id: string) => (await db.select().from(companies).where(eq(companies.id, id)))[0];
 
 describe("getCompanySettings", () => {
-  it("returns the name, website and retention (90 days by default)", () => {
-    const { company } = makeCompany("Globex");
-    expect(getCompanySettings(company.id)).toEqual({ name: "Globex", website: null, retentionDays: 90 });
+  it("returns the name, website and retention (90 days by default)", async () => {
+    const { company } = await makeCompany("Globex");
+    expect(await getCompanySettings(company.id)).toEqual({ name: "Globex", website: null, retentionDays: 90 });
   });
 
-  it("returns null for a missing company", () => {
-    expect(getCompanySettings(crypto.randomUUID())).toBeNull();
+  it("returns null for a missing company", async () => {
+    expect(await getCompanySettings(crypto.randomUUID())).toBeNull();
   });
 });
 
 describe("updateCompanyProfile", () => {
-  it("trims the name and normalizes the website like signup does", () => {
-    const { company } = makeCompany();
-    expect(updateCompanyProfile(company.id, { name: "  Initech  ", website: "Initech.com/careers" })).toEqual({
+  it("trims the name and normalizes the website like signup does", async () => {
+    const { company } = await makeCompany();
+    expect(await updateCompanyProfile(company.id, { name: "  Initech  ", website: "Initech.com/careers" })).toEqual({
       ok: true,
       profile: { name: "Initech", website: "https://initech.com/careers" },
     });
-    expect(companyRow(company.id)).toMatchObject({ name: "Initech", website: "https://initech.com/careers" });
+    expect(await companyRow(company.id)).toMatchObject({ name: "Initech", website: "https://initech.com/careers" });
   });
 
-  it("clears the website when it's left blank", () => {
-    const { company } = makeCompany();
-    updateCompanyProfile(company.id, { name: "Initech", website: "initech.com" });
-    expect(updateCompanyProfile(company.id, { name: "Initech", website: "  " })).toMatchObject({ ok: true });
-    expect(companyRow(company.id).website).toBeNull();
+  it("clears the website when it's left blank", async () => {
+    const { company } = await makeCompany();
+    await updateCompanyProfile(company.id, { name: "Initech", website: "initech.com" });
+    expect(await updateCompanyProfile(company.id, { name: "Initech", website: "  " })).toMatchObject({ ok: true });
+    expect((await companyRow(company.id)).website).toBeNull();
   });
 
-  it("returns field errors and writes nothing for invalid input", () => {
-    const { company } = makeCompany("Before");
-    const result = updateCompanyProfile(company.id, { name: "A", website: "javascript:alert(1)" });
+  it("returns field errors and writes nothing for invalid input", async () => {
+    const { company } = await makeCompany("Before");
+    const result = await updateCompanyProfile(company.id, { name: "A", website: "javascript:alert(1)" });
     expect(result).toEqual({
       ok: false,
       fieldErrors: { name: "Company name must be at least 2 characters.", website: "Enter a valid website, like acme.com." },
     });
-    expect(updateCompanyProfile(company.id, { name: "x".repeat(121) })).toMatchObject({ ok: false });
-    expect(companyRow(company.id)).toMatchObject({ name: "Before", website: null });
+    expect(await updateCompanyProfile(company.id, { name: "x".repeat(121) })).toMatchObject({ ok: false });
+    expect(await companyRow(company.id)).toMatchObject({ name: "Before", website: null });
   });
 
-  it("only changes the given company", () => {
-    const a = makeCompany("A Corp");
-    const b = makeCompany("B Corp");
-    updateCompanyProfile(a.company.id, { name: "A Renamed" });
-    expect(companyRow(b.company.id).name).toBe("B Corp");
-    expect(() => updateCompanyProfile(crypto.randomUUID(), { name: "Ghost" })).toThrow();
+  it("only changes the given company", async () => {
+    const a = await makeCompany("A Corp");
+    const b = await makeCompany("B Corp");
+    await updateCompanyProfile(a.company.id, { name: "A Renamed" });
+    expect((await companyRow(b.company.id)).name).toBe("B Corp");
+    await expect(updateCompanyProfile(crypto.randomUUID(), { name: "Ghost" })).rejects.toThrow("Company not found");
   });
 });
 
 describe("setRetentionDays", () => {
-  it("accepts the offered periods and Off (null)", () => {
-    const { company } = makeCompany();
+  it("accepts the offered periods and Off (null)", async () => {
+    const { company } = await makeCompany();
     for (const days of [30, 180, null, 90] as const) {
-      setRetentionDays(company.id, days);
-      expect(getCompanyRetentionDays(company.id)).toBe(days);
+      await setRetentionDays(company.id, days);
+      expect(await getCompanyRetentionDays(company.id)).toBe(days);
     }
   });
 
-  it("rejects anything else without writing", () => {
-    const { company } = makeCompany();
+  it("rejects anything else without writing", async () => {
+    const { company } = await makeCompany();
     for (const days of [0, 1, 7, 89, 365, -30, 90.5, Number.NaN]) {
-      expect(() => setRetentionDays(company.id, days)).toThrow();
+      await expect(setRetentionDays(company.id, days)).rejects.toThrow("Unsupported retention period");
     }
-    expect(() => setRetentionDays(company.id, "90" as never)).toThrow();
-    expect(companyRow(company.id).retentionDays).toBe(90);
+    await expect(setRetentionDays(company.id, "90" as never)).rejects.toThrow("Unsupported retention period");
+    expect((await companyRow(company.id)).retentionDays).toBe(90);
   });
 
-  it("only changes the given company", () => {
-    const a = makeCompany();
-    const b = makeCompany();
-    setRetentionDays(a.company.id, 30);
-    expect(getCompanyRetentionDays(b.company.id)).toBe(90);
-    expect(() => setRetentionDays(crypto.randomUUID(), 30)).toThrow();
+  it("only changes the given company", async () => {
+    const a = await makeCompany();
+    const b = await makeCompany();
+    await setRetentionDays(a.company.id, 30);
+    expect(await getCompanyRetentionDays(b.company.id)).toBe(90);
+    await expect(setRetentionDays(crypto.randomUUID(), 30)).rejects.toThrow("Company not found");
   });
 });
 

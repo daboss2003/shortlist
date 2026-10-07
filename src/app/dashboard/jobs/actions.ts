@@ -41,7 +41,7 @@ function readJobForm(formData: FormData): Record<JobField, string> {
 /** Tenant check shared by every action that targets an existing job: missing or foreign → 404. */
 async function requireOwnJob(jobId: unknown): Promise<{ companyId: string; job: Job }> {
   const { companyId } = await requireEmployer();
-  const job = typeof jobId === "string" ? getJobForCompany(companyId, jobId) : null;
+  const job = typeof jobId === "string" ? await getJobForCompany(companyId, jobId) : null;
   if (!job) notFound();
   return { companyId, job };
 }
@@ -62,7 +62,7 @@ export async function createJobAction(_prev: JobFormState, formData: FormData): 
   const parsed = jobService.parseJobInput(values);
   if (!parsed.ok) return { fieldErrors: parsed.fieldErrors, values };
 
-  const job = jobService.createJob(companyId, parsed.data);
+  const job = await jobService.createJob(companyId, parsed.data);
   revalidateJobViews(job);
   redirect(`/dashboard/jobs/${job.id}`);
 }
@@ -73,7 +73,7 @@ export async function updateJobAction(jobId: string, _prev: JobFormState, formDa
   const parsed = jobService.parseJobInput(values);
   if (!parsed.ok) return { fieldErrors: parsed.fieldErrors, values };
 
-  if (!jobService.updateJob(companyId, job.id, parsed.data)) notFound();
+  if (!(await jobService.updateJob(companyId, job.id, parsed.data))) notFound();
   revalidateJobViews(job);
   redirect(`/dashboard/jobs/${job.id}`);
 }
@@ -91,6 +91,6 @@ export async function setJobStatus(jobId: string, status: JobStatus): Promise<vo
   const parsed = z.enum(JOB_STATUSES).safeParse(status);
   if (!parsed.success) throw new Error("Invalid job status");
 
-  if (!jobService.setJobStatus(companyId, job.id, parsed.data)) notFound();
+  if (!(await jobService.setJobStatus(companyId, job.id, parsed.data))) notFound();
   revalidateJobViews(job);
 }

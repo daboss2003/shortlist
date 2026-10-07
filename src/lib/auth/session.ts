@@ -25,16 +25,16 @@ export type Employer = {
 };
 
 /** Creates a session row and returns the raw token (only the hash is stored). */
-export function insertSession(userId: string): { token: string; expiresAt: Date } {
+export async function insertSession(userId: string): Promise<{ token: string; expiresAt: Date }> {
   const token = randomBytes(32).toString("base64url");
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  db.delete(sessions).where(lt(sessions.expiresAt, new Date())).run();
-  db.insert(sessions).values({ id: hashToken(token), userId, expiresAt }).run();
+  await db.delete(sessions).where(lt(sessions.expiresAt, new Date()));
+  await db.insert(sessions).values({ id: hashToken(token), userId, expiresAt });
   return { token, expiresAt };
 }
 
-export function findEmployerBySessionToken(token: string): Employer | null {
-  const row = db
+export async function findEmployerBySessionToken(token: string): Promise<Employer | null> {
+  const [row] = await db
     .select({
       userId: users.id,
       name: users.name,
@@ -48,17 +48,17 @@ export function findEmployerBySessionToken(token: string): Employer | null {
     .innerJoin(users, eq(users.id, sessions.userId))
     .innerJoin(companies, eq(companies.id, users.companyId))
     .where(and(eq(sessions.id, hashToken(token)), gt(sessions.expiresAt, new Date())))
-    .get();
+    .limit(1);
   return row ?? null;
 }
 
-export function deleteSessionByToken(token: string): void {
-  db.delete(sessions).where(eq(sessions.id, hashToken(token))).run();
+export async function deleteSessionByToken(token: string): Promise<void> {
+  await db.delete(sessions).where(eq(sessions.id, hashToken(token)));
 }
 
 /** Starts a session for the user and sets the cookie. Call from a Server Action or Route Handler. */
 export async function startSession(userId: string): Promise<void> {
-  const { token, expiresAt } = insertSession(userId);
+  const { token, expiresAt } = await insertSession(userId);
   (await cookies()).set(SESSION_COOKIE, token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
@@ -71,6 +71,6 @@ export async function startSession(userId: string): Promise<void> {
 export async function endSession(): Promise<void> {
   const store = await cookies();
   const token = store.get(SESSION_COOKIE)?.value;
-  if (token) deleteSessionByToken(token);
+  if (token) await deleteSessionByToken(token);
   store.delete(SESSION_COOKIE);
 }

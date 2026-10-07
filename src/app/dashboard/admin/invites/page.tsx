@@ -25,7 +25,7 @@ export default function InvitesPage() {
 
 async function InvitesContent() {
   await requirePlatformAdmin();
-  const invites = listInvites();
+  const invites = await listInvites();
 
   return (
     <div className="space-y-6">

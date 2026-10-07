@@ -133,58 +133,67 @@ function makeJobSlug(title: string): string {
 
 const ownJob = (companyId: string, jobId: string) => and(eq(jobs.id, jobId), eq(jobs.companyId, companyId));
 
-export function createJob(companyId: string, data: JobData): Job {
-  return db
+export async function createJob(companyId: string, data: JobData): Promise<Job> {
+  const [job] = await db
     .insert(jobs)
     .values({ ...data, companyId, slug: makeJobSlug(data.title) })
-    .returning()
-    .get();
+    .returning();
+  return job;
 }
 
 /** The slug is deliberately left alone so links already shared keep working. */
-export function updateJob(companyId: string, jobId: string, data: JobData): Job | null {
-  return db.update(jobs).set(data).where(ownJob(companyId, jobId)).returning().get() ?? null;
+export async function updateJob(companyId: string, jobId: string, data: JobData): Promise<Job | null> {
+  const [job] = await db.update(jobs).set(data).where(ownJob(companyId, jobId)).returning();
+  return job ?? null;
 }
 
 /** Closing starts the candidate-data retention clock (kept as-is if already closed); reopening stops it. */
-export function setJobStatus(companyId: string, jobId: string, status: JobStatus): boolean {
-  const closedAt = status === "closed" ? sql`coalesce(${jobs.closedAt}, ${Date.now()})` : null;
-  return db.update(jobs).set({ status, closedAt }).where(ownJob(companyId, jobId)).run().changes > 0;
+export async function setJobStatus(companyId: string, jobId: string, status: JobStatus): Promise<boolean> {
+  const closedAt = status === "closed" ? sql`coalesce(${jobs.closedAt}, ${new Date().toISOString()}::timestamptz)` : null;
+  const updated = await db
+    .update(jobs)
+    .set({ status, closedAt })
+    .where(ownJob(companyId, jobId))
+    .returning({ id: jobs.id });
+  return updated.length > 0;
 }
 
 /** The company's most recently created job, or null. The new-job page keys its form on it. */
-export function newestJobId(companyId: string): string | null {
-  return (
-    db
-      .select({ id: jobs.id })
-      .from(jobs)
-      .where(eq(jobs.companyId, companyId))
-      .orderBy(desc(jobs.createdAt), desc(jobs.id))
-      .limit(1)
-      .get()?.id ?? null
-  );
+export async function newestJobId(companyId: string): Promise<string | null> {
+  const [job] = await db
+    .select({ id: jobs.id })
+    .from(jobs)
+    .where(eq(jobs.companyId, companyId))
+    .orderBy(desc(jobs.createdAt), desc(jobs.id))
+    .limit(1);
+  return job?.id ?? null;
 }
 
-export function countJobCandidates(companyId: string, jobId: string): number {
-  return (
-    db
-      .select({ n: count() })
-      .from(candidates)
-      .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, jobId)))
-      .get()?.n ?? 0
-  );
+export async function countJobCandidates(companyId: string, jobId: string): Promise<number> {
+  const [row] = await db
+    .select({ n: count() })
+    .from(candidates)
+    .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, jobId)));
+  return row?.n ?? 0;
 }
 
 /** Deletes the job (candidates cascade) and then its candidates' CV files. */
 export async function deleteJob(companyId: string, jobId: string): Promise<boolean> {
-  // No await between the select and the delete, so (single process, sync SQLite) no candidate can slip in between.
-  const fileKeys = db
-    .select({ key: candidates.cvFileKey })
-    .from(candidates)
-    .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, jobId)))
-    .all()
-    .map((r) => r.key);
-  if (db.delete(jobs).where(ownJob(companyId, jobId)).run().changes === 0) return false;
+  const fileKeys = await db.transaction(async (tx) => {
+    // Lock the job row first. A candidate insert takes a key-share lock on its job (the foreign key check), so this
+    // waits for in-flight applications to commit and blocks new ones until the job is gone (they then fail the FK
+    // check and remove their own file). The keys read next are therefore exactly the candidates the cascade deletes,
+    // and no CV file is left behind unreferenced.
+    const [job] = await tx.select({ id: jobs.id }).from(jobs).where(ownJob(companyId, jobId)).for("update");
+    if (!job) return null;
+    const rows = await tx
+      .select({ key: candidates.cvFileKey })
+      .from(candidates)
+      .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, job.id)));
+    await tx.delete(jobs).where(ownJob(companyId, job.id));
+    return rows.map((r) => r.key);
+  });
+  if (!fileKeys) return false;
 
   const results = await Promise.allSettled(fileKeys.map((key) => deleteCvFile(key)));
   for (const [i, r] of results.entries()) {

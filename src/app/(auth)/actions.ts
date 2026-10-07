@@ -45,7 +45,7 @@ export async function signupAction(_prev: SignupState, formData: FormData): Prom
   const echo = { ...values, password: "" };
 
   // Intentional: per-IP cap on account creation (not in the original spec) — each signup costs a scrypt hash and a row.
-  if (!rateLimit(`signup:${await requestIp()}`, 10, 60 * 60_000).ok) {
+  if (!(await rateLimit(`signup:${await requestIp()}`, 10, 60 * 60_000)).ok) {
     return { formError: TOO_MANY, values: echo };
   }
 
@@ -67,25 +67,35 @@ export async function loginAction(_prev: LoginState, formData: FormData): Promis
 
   const ip = await requestIp();
   const ipKey = `login-ip:${ip}`;
-  if (!peek(ipKey, LOGIN_LIMITS.ip).ok) return { error: TOO_MANY, email };
+  if (!(await peek(ipKey, LOGIN_LIMITS.ip)).ok) return { error: TOO_MANY, email };
 
   // Strict per email+IP stops one attacker guessing one password; the loose per-email cap slows spraying from
   // many IPs without letting a single attacker lock the owner out.
   const emailIpKey = `login:${email}|${ip}`;
   const emailKey = `login-email:${email}`;
-  if (!peek(emailIpKey, LOGIN_LIMITS.emailIp).ok || !peek(emailKey, LOGIN_LIMITS.email).ok) {
+  const [emailIpPeek, emailPeek] = await Promise.all([
+    peek(emailIpKey, LOGIN_LIMITS.emailIp),
+    peek(emailKey, LOGIN_LIMITS.email),
+  ]);
+  if (!emailIpPeek.ok || !emailPeek.ok) return { error: TOO_MANY, email };
+
+  // Intentional: count the attempt before the slow password check and refund it on success, so only failures end
+  // up counted. The peeks above are a cheap fast path only: a burst of parallel guesses can all pass them before
+  // any is counted. Each hit is atomic, so the counts it returns are what enforce the limits; an attempt over any
+  // limit takes its hits back (blocked attempts never count) and is refused.
+  const keys = [ipKey, emailIpKey, emailKey];
+  const limits = [LOGIN_LIMITS.ip, LOGIN_LIMITS.emailIp, LOGIN_LIMITS.email];
+  const refundAll = () => Promise.all(keys.map((key) => refund(key)));
+  const counts = await Promise.all(keys.map((key) => hit(key, LOGIN_WINDOW_MS)));
+  if (counts.some((n, i) => n > limits[i])) {
+    await refundAll();
     return { error: TOO_MANY, email };
   }
-
-  // Intentional: count the attempt before the slow password check and refund it on success. Only failures end
-  // up counted, but a burst of parallel guesses can't all pass the peeks above before any of them fails.
-  const keys = [ipKey, emailIpKey, emailKey];
-  for (const key of keys) hit(key, LOGIN_WINDOW_MS);
 
   const userId = await authenticate(email, password);
   if (!userId) return { error: INCORRECT, email };
 
-  for (const key of keys) refund(key);
+  await refundAll();
   await startSession(userId);
   redirect("/dashboard");
 }

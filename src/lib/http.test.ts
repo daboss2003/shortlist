@@ -57,6 +57,41 @@ describe("clientIp", () => {
   });
 });
 
+describe("clientIp on Netlify", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("uses x-nf-client-connection-ip, which Netlify's edge sets, over any X-Forwarded-For", () => {
+    vi.stubEnv("NETLIFY", "true");
+    const headers = { "x-nf-client-connection-ip": " 198.51.100.23 ", "x-forwarded-for": "1.1.1.1, 203.0.113.9" };
+    expect(clientIp(req(headers))).toBe("198.51.100.23");
+    expect(clientIpFromHeaders(new Headers(headers))).toBe("198.51.100.23");
+  });
+
+  it("ignores x-nf-client-connection-ip when not on Netlify, since a client could send it", () => {
+    for (const value of [undefined, "", "false", "1", "TRUE"]) {
+      if (value === undefined) vi.stubEnv("NETLIFY", undefined);
+      else vi.stubEnv("NETLIFY", value);
+      expect(clientIp(req({ "x-nf-client-connection-ip": "6.6.6.6", "x-forwarded-for": "203.0.113.9" }))).toBe(
+        "203.0.113.9",
+      );
+    }
+  });
+
+  it("falls back to the X-Forwarded-For logic when the header is missing or blank", () => {
+    vi.stubEnv("NETLIFY", "true");
+    expect(clientIp(req({ "x-forwarded-for": "1.1.1.1, 203.0.113.9" }))).toBe("203.0.113.9");
+    expect(clientIp(req({ "x-nf-client-connection-ip": "  ", "x-real-ip": "203.0.113.7" }))).toBe("203.0.113.7");
+    expect(clientIp(req({}))).toBe("unknown");
+  });
+
+  it("caps its length too", () => {
+    vi.stubEnv("NETLIFY", "true");
+    expect(clientIp(req({ "x-nf-client-connection-ip": "y".repeat(10_000) }))).toHaveLength(64);
+  });
+});
+
 describe("security headers (next.config.ts)", () => {
   afterEach(() => {
     vi.unstubAllEnvs();

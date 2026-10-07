@@ -1,5 +1,5 @@
 import "server-only";
-import { eq } from "drizzle-orm";
+import { DrizzleQueryError, eq } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { companies, users } from "@/db/schema";
@@ -36,11 +36,11 @@ export async function seedPlatformAdmin(): Promise<void> {
       return;
     }
 
-    const existing = db
+    const [existing] = await db
       .select({ id: users.id, isPlatformAdmin: users.isPlatformAdmin, passwordHash: users.passwordHash })
       .from(users)
       .where(eq(users.email, email))
-      .get();
+      .limit(1);
     if (existing) {
       // Intentional: create-only so env can't silently reset a password the admin may have changed.
       if (existing.isPlatformAdmin) return;
@@ -50,7 +50,7 @@ export async function seedPlatformAdmin(): Promise<void> {
         console.error("[admin] ADMIN_EMAIL belongs to an existing account whose password doesn't match ADMIN_PASSWORD — not promoted");
         return;
       }
-      db.update(users).set({ isPlatformAdmin: true }).where(eq(users.id, existing.id)).run();
+      await db.update(users).set({ isPlatformAdmin: true }).where(eq(users.id, existing.id));
       console.info("[admin] Existing account promoted to platform admin.");
       return;
     }
@@ -58,12 +58,29 @@ export async function seedPlatformAdmin(): Promise<void> {
     const name = process.env.ADMIN_NAME?.trim().slice(0, 120) || "Admin";
     const companyName = process.env.ADMIN_COMPANY_NAME?.trim().slice(0, 120) || APP_NAME;
     const passwordHash = await hashPassword(password);
-    db.transaction((tx) => {
-      const company = tx.insert(companies).values({ name: companyName }).returning({ id: companies.id }).get();
-      tx.insert(users).values({ companyId: company.id, name, email, passwordHash, isPlatformAdmin: true }).run();
+    await db.transaction(async (tx) => {
+      const [company] = await tx.insert(companies).values({ name: companyName }).returning({ id: companies.id });
+      await tx.insert(users).values({ companyId: company.id, name, email, passwordHash, isPlatformAdmin: true });
     });
     console.info("[admin] Platform admin account created.");
   } catch (err) {
-    console.error("[admin] Could not seed the platform admin:", err instanceof Error ? err.message : err);
+    // Intentional: quiet on a duplicate email. Every serverless cold start seeds, so two instances booting together
+    // both find no admin and race to create one; the loser's transaction rolls back and the winner's admin stands.
+    if (isUniqueViolation(err)) return;
+    console.error("[admin] Could not seed the platform admin:", safeErrorMessage(err));
   }
+}
+
+function isUniqueViolation(err: unknown): boolean {
+  for (let e = err, depth = 0; e && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
+    if ((e as { code?: unknown }).code === "23505") return true;
+  }
+  return false;
+}
+
+/** A DrizzleQueryError's message embeds the query params (here the email and password hash); log the driver's instead. */
+function safeErrorMessage(err: unknown): unknown {
+  let e = err;
+  while (e instanceof DrizzleQueryError) e = e.cause;
+  return e instanceof Error ? e.message : e;
 }
