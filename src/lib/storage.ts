@@ -6,7 +6,7 @@ import type { CvFileType } from "@/lib/cv/file-type";
 // Local-disk CV storage under UPLOAD_DIR (default ./data/uploads). Keys are server-generated
 // (uuid + extension); user-supplied file names never reach the filesystem path.
 
-const KEY_PATTERN = /^[0-9a-f-]{36}\.(pdf|docx|txt)$/;
+const KEY_PATTERN = /^[0-9a-f-]{36}\.(pdf|docx|doc|txt)$/;
 
 // Intentional: turbopackIgnore — uploads are runtime data, not code; without it the build traces the whole project.
 const uploadDir = () => process.env.UPLOAD_DIR ?? path.join(/*turbopackIgnore: true*/ process.cwd(), "data", "uploads");
