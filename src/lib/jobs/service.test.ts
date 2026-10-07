@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -10,6 +11,7 @@ import {
   countJobCandidates,
   createJob,
   deleteJob,
+  newestJobId,
   parseJobInput,
   setJobStatus,
   slugify,
@@ -43,7 +45,14 @@ function errorsFor(overrides: Record<string, unknown>) {
 
 const pdfCv = (): ValidatedCv => {
   const bytes = Buffer.from("%PDF-1.4\n% test cv\n");
-  return { bytes, fileName: "cv.pdf", fileType: "pdf", mimeType: "application/pdf", size: bytes.length };
+  return {
+    bytes,
+    fileName: "cv.pdf",
+    fileType: "pdf",
+    mimeType: "application/pdf",
+    size: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  };
 };
 const cvPath = (key: string) => path.join(process.env.UPLOAD_DIR!, key);
 
@@ -169,6 +178,21 @@ describe("createJob / updateJob", () => {
   });
 });
 
+describe("newestJobId", () => {
+  it("is the company's most recently created job, changing with every new job", () => {
+    const a = makeCompany();
+    const b = makeCompany();
+    expect(newestJobId(a.company.id)).toBeNull();
+    const first = createJob(a.company.id, parse());
+    expect(newestJobId(a.company.id)).toBe(first.id);
+    db.update(jobs).set({ createdAt: new Date(Date.now() - 60_000) }).where(eq(jobs.id, first.id)).run();
+    const second = createJob(a.company.id, parse());
+    expect(newestJobId(a.company.id)).toBe(second.id);
+    createJob(b.company.id, parse());
+    expect(newestJobId(a.company.id)).toBe(second.id);
+  });
+});
+
 describe("setJobStatus", () => {
   it("closes and reopens the company's own job", () => {
     const { company } = makeCompany();
@@ -177,6 +201,23 @@ describe("setJobStatus", () => {
     expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("closed");
     expect(setJobStatus(company.id, job.id, "open")).toBe(true);
     expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("open");
+  });
+
+  it("starts the retention clock on close, keeps it on a repeat close, and clears it on reopen", () => {
+    const { company } = makeCompany();
+    const job = createJob(company.id, parse());
+    const closedAt = () => db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.closedAt;
+    expect(closedAt()).toBeNull();
+
+    setJobStatus(company.id, job.id, "closed");
+    const first = closedAt();
+    expect(first).toBeInstanceOf(Date);
+    db.update(jobs).set({ closedAt: new Date(first!.getTime() - 1000) }).where(eq(jobs.id, job.id)).run();
+    setJobStatus(company.id, job.id, "closed");
+    expect(closedAt()!.getTime()).toBe(first!.getTime() - 1000);
+
+    setJobStatus(company.id, job.id, "open");
+    expect(closedAt()).toBeNull();
   });
 
   it("cannot change another company's job", () => {

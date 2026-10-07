@@ -47,9 +47,6 @@ export default function LandingPage() {
             <Link href="/login" className={footerLink}>
               Log in
             </Link>
-            <Link href="/signup" className={footerLink}>
-              Create an account
-            </Link>
           </nav>
         </div>
       </footer>
@@ -73,16 +70,13 @@ async function HeaderActions() {
 
 function SignedOutActions() {
   return (
-    <div className="flex items-center gap-2">
-      <ButtonLink href="/login" variant="ghost" size="sm">
-        Log in
-      </ButtonLink>
-      <ButtonLink href="/signup" size="sm">
-        Get started
-      </ButtonLink>
-    </div>
+    <ButtonLink href="/login" variant="secondary" size="sm">
+      Log in
+    </ButtonLink>
   );
 }
+
+const INVITE_NOTE = "Have an invite? Use the link you were sent.";
 
 function Hero() {
   return (
@@ -97,14 +91,15 @@ function Hero() {
           structured profile and a match score with the reasons behind it, so you start with the strongest applicants.
         </p>
         <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-          <ButtonLink href="/signup" size="lg">
-            Create a free account
+          <ButtonLink href="/login" size="lg">
+            Log in
             <ArrowRight aria-hidden />
           </ButtonLink>
           <ButtonLink href="#how-it-works" variant="secondary" size="lg">
             See how it works
           </ButtonLink>
         </div>
+        <p className="mt-3 text-sm text-ink-muted">Accounts are by invitation. {INVITE_NOTE}</p>
         <ul className="mt-8 grid gap-2 text-sm text-ink-muted sm:grid-cols-2">
           {[
             "PDF, Word and plain-text CVs",
@@ -273,10 +268,12 @@ function ClosingCta() {
       <Card className="flex flex-col gap-6 px-6 py-8 sm:flex-row sm:items-center sm:justify-between sm:px-10">
         <div>
           <h2 className="text-xl font-semibold tracking-tight text-ink">Ready to fill your next role?</h2>
-          <p className="mt-1 text-base text-ink-muted">Create your first job and share its link in a few minutes.</p>
+          <p className="mt-1 text-base text-ink-muted">
+            {INVITE_NOTE} You can post your first job and share its link in a few minutes.
+          </p>
         </div>
-        <ButtonLink href="/signup" size="lg" className="shrink-0">
-          Create a free account
+        <ButtonLink href="/login" size="lg" className="shrink-0">
+          Log in
           <ArrowRight aria-hidden />
         </ButtonLink>
       </Card>

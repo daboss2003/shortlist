@@ -1,5 +1,7 @@
-import Link from "next/link";
 import { Suspense } from "react";
+import { getCurrentEmployer } from "@/lib/auth/dal";
+import { MainNav } from "./_components/main-nav";
+import { NavTabs } from "./_components/nav-tabs";
 import { UserMenu, UserMenuSkeleton } from "./_components/user-menu";
 import { Wordmark } from "./_components/wordmark";
 
@@ -7,18 +9,17 @@ export default function DashboardLayout({ children }: LayoutProps<"/dashboard">)
   return (
     <>
       <header className="border-b border-line bg-surface">
-        <div className="mx-auto flex h-14 w-full max-w-6xl items-center gap-4 px-4 sm:gap-8 sm:px-6 lg:px-8">
-          <Wordmark href="/dashboard" />
-          <nav aria-label="Main" className="flex h-full items-center">
-            {/* Intentional: Jobs is the only section and every dashboard page lives under it, so it's always the active tab. */}
-            <Link
-              href="/dashboard"
-              className="flex h-full items-center border-b-2 border-brand px-1 pt-0.5 text-sm font-medium text-ink transition-colors hover:text-brand-ink focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-brand"
-            >
-              Jobs
-            </Link>
+        {/* Below sm the tabs wrap onto their own row under the logo and user menu. */}
+        <div className="mx-auto flex w-full max-w-6xl flex-wrap items-center gap-x-4 px-4 sm:flex-nowrap sm:gap-x-8 sm:px-6 lg:px-8">
+          <div className="flex h-14 items-center">
+            <Wordmark href="/dashboard" />
+          </div>
+          <nav aria-label="Main" className="order-last flex h-11 w-full items-center gap-5 sm:order-0 sm:h-14 sm:w-auto">
+            <Suspense fallback={<NavTabs active={null} isAdmin={false} />}>
+              <SessionNav />
+            </Suspense>
           </nav>
-          <div className="ml-auto flex min-w-0 justify-end">
+          <div className="ml-auto flex h-14 min-w-0 items-center justify-end">
             <Suspense fallback={<UserMenuSkeleton />}>
               <UserMenu />
             </Suspense>
@@ -28,4 +29,9 @@ export default function DashboardLayout({ children }: LayoutProps<"/dashboard">)
       <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6 lg:px-8">{children}</main>
     </>
   );
+}
+
+async function SessionNav() {
+  const employer = await getCurrentEmployer();
+  return <MainNav isAdmin={employer?.isPlatformAdmin === true} />;
 }

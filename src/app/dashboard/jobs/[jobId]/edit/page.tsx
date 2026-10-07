@@ -35,6 +35,10 @@ async function EditJob({ params }: PageProps<"/dashboard/jobs/[jobId]/edit">) {
         <Alert tone="info">Saving doesn&apos;t re-score existing candidates — use Re-score all on the job page.</Alert>
       )}
       <JobForm
+        // Intentional: remount whenever the job changes. Cache Components keeps this page mounted (React Activity),
+        // and after a save React resets the uncontrolled fields to the defaults they were mounted with — the old
+        // job — so a second edit would silently send the first edit's stale values back.
+        key={job.updatedAt.getTime()}
         action={updateJobAction.bind(null, job.id)}
         defaults={{
           title: job.title,

@@ -4,10 +4,11 @@ import { Briefcase, Plus } from "lucide-react";
 import { ButtonLink } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { EmptyState, LoadingBlock } from "@/components/ui/feedback";
+import { getAiQuota } from "@/lib/ai/quota";
 import { getAiStatus } from "@/lib/ai/status";
 import { requireEmployer } from "@/lib/auth/dal";
 import { listJobsWithStats } from "@/lib/data/jobs";
-import { AiStatusNotice } from "./_components/ai-status-notice";
+import { AiStatusNotice, AiUsageNote } from "./_components/ai-status-notice";
 import { JobsTable } from "./_components/jobs-table";
 import { PageHeader } from "./_components/page-header";
 
@@ -34,13 +35,14 @@ export default function JobsPage() {
 }
 
 async function JobsContent() {
-  const { companyId } = await requireEmployer();
+  const { companyId, isPlatformAdmin } = await requireEmployer();
   const jobs = listJobsWithStats(companyId);
   const ai = getAiStatus();
+  const quota = getAiQuota(companyId);
 
   return (
     <div className="space-y-6">
-      <AiStatusNotice status={ai} />
+      <AiStatusNotice status={ai} quota={quota} showOperatorDetails={isPlatformAdmin === true} />
       {jobs.length === 0 ? (
         <Card>
           <EmptyState
@@ -58,11 +60,7 @@ async function JobsContent() {
       ) : (
         <div className="space-y-3">
           <JobsTable jobs={jobs} />
-          {ai.primary && (
-            <p className="text-xs text-ink-muted">
-              Candidates are ranked by {ai.primary.label} ({ai.primary.modelId}).
-            </p>
-          )}
+          <AiUsageNote status={ai} quota={quota} />
         </div>
       )}
     </div>

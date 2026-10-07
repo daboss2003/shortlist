@@ -1,6 +1,6 @@
 import "server-only";
 import { randomBytes } from "node:crypto";
-import { and, count, eq } from "drizzle-orm";
+import { and, count, desc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { EMPLOYMENT_TYPES, candidates, jobs, type Job, type JobStatus } from "@/db/schema";
@@ -146,8 +146,23 @@ export function updateJob(companyId: string, jobId: string, data: JobData): Job 
   return db.update(jobs).set(data).where(ownJob(companyId, jobId)).returning().get() ?? null;
 }
 
+/** Closing starts the candidate-data retention clock (kept as-is if already closed); reopening stops it. */
 export function setJobStatus(companyId: string, jobId: string, status: JobStatus): boolean {
-  return db.update(jobs).set({ status }).where(ownJob(companyId, jobId)).run().changes > 0;
+  const closedAt = status === "closed" ? sql`coalesce(${jobs.closedAt}, ${Date.now()})` : null;
+  return db.update(jobs).set({ status, closedAt }).where(ownJob(companyId, jobId)).run().changes > 0;
+}
+
+/** The company's most recently created job, or null. The new-job page keys its form on it. */
+export function newestJobId(companyId: string): string | null {
+  return (
+    db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(eq(jobs.companyId, companyId))
+      .orderBy(desc(jobs.createdAt), desc(jobs.id))
+      .limit(1)
+      .get()?.id ?? null
+  );
 }
 
 export function countJobCandidates(companyId: string, jobId: string): number {
