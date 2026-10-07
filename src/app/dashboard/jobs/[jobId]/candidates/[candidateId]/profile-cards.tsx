@@ -7,7 +7,7 @@ import type { CandidateProfile } from "@/lib/ai/schemas";
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <section>
+    <section className="min-w-0">
       <h3 className="mb-3 text-sm font-medium text-ink">{title}</h3>
       {children}
     </section>
@@ -99,8 +99,8 @@ function BadgeList({ items }: { items: string[] }) {
   return (
     <ul className="flex flex-wrap gap-1.5">
       {items.map((item, i) => (
-        <li key={`${i}-${item}`}>
-          <Badge tone="neutral" className="whitespace-normal">
+        <li key={`${i}-${item}`} className="min-w-0 max-w-full">
+          <Badge tone="neutral" wrap>
             {item}
           </Badge>
         </li>

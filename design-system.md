@@ -33,7 +33,8 @@ Icons: `lucide-react` only, `size-4` inline (buttons size them automatically), `
 - `button.tsx`: `Button`, `ButtonLink`, `buttonClass(variant, size)` — variants primary | secondary | ghost | danger; sizes sm | md | lg.
 - `field.tsx`: `Input`, `Textarea`, `Select`, `Label`, `Field` (label + hint/error with ids; set `aria-invalid` + `aria-describedby` on the control).
 - `card.tsx`: `Card`, `CardHeader` (title/description/actions), `CardBody`.
-- `badge.tsx`: `Badge` with tone neutral | brand | success | warning | danger.
+- `badge.tsx`: `Badge` with tone neutral | brand | success | warning | danger. Use `wrap` for chips that show free text
+  (skills, languages), and put them in `<li className="min-w-0 max-w-full">` so a long name wraps instead of overflowing.
 - `feedback.tsx`: `Spinner`, `LoadingBlock` (Suspense fallback), `Alert` (info | success | warning | danger), `EmptyState`.
 - Labels and score colour: `src/lib/format.ts` (`*_LABELS`, `scoreTone`, `formatDate`, `formatBytes`). Never hard-code enum labels.
 

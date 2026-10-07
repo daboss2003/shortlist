@@ -38,7 +38,7 @@ function ScoreMeter({ label, value }: { label: string; value: number }) {
 function PointList({ title, points, tone }: { title: string; points: string[]; tone: "success" | "warning" }) {
   const Icon = tone === "success" ? CheckCircle2 : AlertTriangle;
   return (
-    <section>
+    <section className="min-w-0">
       <h3 className="mb-2 text-sm font-medium text-ink">{title}</h3>
       {points.length > 0 ? (
         <ul className="space-y-2">
@@ -58,13 +58,13 @@ function PointList({ title, points, tone }: { title: string; points: string[]; t
 
 function SkillList({ title, skills, tone, empty }: { title: string; skills: string[]; tone: BadgeTone; empty: string }) {
   return (
-    <section>
+    <section className="min-w-0">
       <h3 className="mb-2 text-sm font-medium text-ink">{title}</h3>
       {skills.length > 0 ? (
         <ul className="flex flex-wrap gap-1.5">
           {skills.map((skill, i) => (
-            <li key={`${i}-${skill}`}>
-              <Badge tone={tone} className="whitespace-normal">
+            <li key={`${i}-${skill}`} className="min-w-0 max-w-full">
+              <Badge tone={tone} wrap>
                 {skill}
               </Badge>
             </li>
