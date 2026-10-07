@@ -128,3 +128,7 @@ process. A CV that fails processing three times is marked *Failed* instead of be
 | `pnpm invite [email] [--days N]` | Print a one-time signup link (optionally locked to an email) |
 
 See `CLAUDE.md` for architecture and conventions, and `design-system.md` for UI rules.
+
+## License
+
+[MIT](LICENSE) © 2026 Samson Oluwafemi
