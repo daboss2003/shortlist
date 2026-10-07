@@ -1,3 +1,5 @@
+<img src="public/brand/icon-512.png" width="64" height="64" alt="Shortlist logo">
+
 # Shortlist — CV collection & AI ranking
 
 Create a job, share its link, and let applicants upload their CV, or upload CVs you already have.

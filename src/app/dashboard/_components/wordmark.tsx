@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { ListFilter } from "lucide-react";
+import { BrandMark } from "@/components/brand-mark";
 import { APP_NAME } from "@/lib/brand";
 import { cn } from "@/lib/cn";
 
@@ -13,9 +13,7 @@ export function Wordmark({ href, className }: { href: string; className?: string
         className,
       )}
     >
-      <span className="flex size-7 items-center justify-center rounded-lg bg-brand text-white shadow-xs">
-        <ListFilter className="size-4" strokeWidth={2.5} aria-hidden />
-      </span>
+      <BrandMark className="shadow-xs rounded-lg" />
       <span className="text-base font-semibold tracking-tight">{APP_NAME}</span>
     </Link>
   );
