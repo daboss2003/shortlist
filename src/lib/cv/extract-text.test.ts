@@ -4,8 +4,8 @@ import path from "node:path";
 import zlib from "node:zlib";
 import JSZip from "jszip";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
-import { normalizeText, wordXmlText } from "../../../scripts/extract-cv-text.mjs";
-import { extractCvText, runCvExtractor } from "./extract-text";
+import { normalizeText, wordXmlText } from "./extract-core.mjs";
+import { extractCvText as extractCvTextIn, extractionMode, runCvExtractor, runInlineExtractor, type ExtractionMode } from "./extract-text";
 
 async function buildDocx(paragraphs: string[]): Promise<Buffer> {
   const zip = new JSZip();
@@ -122,7 +122,11 @@ function buildPdf(pages: string[]): Buffer {
   return Buffer.from(pdf, "latin1");
 }
 
-describe("extractCvText", () => {
+// Both modes run the same extractor; every behaviour below must hold in each.
+describe.each(["isolated", "inline"] as const)("extractCvText (%s)", (mode: ExtractionMode) => {
+  const extractCvText = (bytes: Buffer, fileType: Parameters<typeof extractCvTextIn>[1]) =>
+    extractCvTextIn(bytes, fileType, { mode });
+
   it("decodes plain text as UTF-8", async () => {
     const text = await extractCvText(Buffer.from("﻿José Müller\nSenior Engineer\n", "utf8"), "txt");
     expect(text).toBe("José Müller\nSenior Engineer");
@@ -207,9 +211,8 @@ describe("extractCvText", () => {
     expect(text).toHaveLength(200_000);
   });
 
-  it("rejects a DOCX zip bomb from its declared sizes, quickly and outside this process", async () => {
-    const para = "<w:p><w:r><w:t>Lorem ipsum dolor sit amet</w:t></w:r></w:p>";
-    const bomb = await zipOf({ "word/document.xml": para.repeat(Math.ceil((21 * 1024 * 1024) / para.length)) });
+  it("rejects a DOCX zip bomb from its declared sizes, quickly and without decompressing it", async () => {
+    const bomb = await fixtures.declaredBomb();
     expect(bomb.length).toBeLessThan(1024 * 1024);
 
     const rssBefore = process.memoryUsage().rss;
@@ -219,19 +222,33 @@ describe("extractCvText", () => {
     expect(process.memoryUsage().rss - rssBefore).toBeLessThan(100 * 1024 * 1024);
   });
 
-  it("rejects a DOCX whose entries are each under the limit but too large in total", async () => {
-    const big = "a".repeat(14 * 1024 * 1024);
-    const docx = await zipOf({ "word/document.xml": big, "word/a.xml": big, "word/b.xml": big });
-    await expect(extractCvText(docx, "docx")).rejects.toThrow(/DOCX content too large/);
-  });
-
   it(
+    "rejects a DOCX whose entries are each under the limit but too large in total",
+    async () => {
+      await expect(extractCvText(await fixtures.tooLargeInTotal(), "docx")).rejects.toThrow(/DOCX content too large/);
+    },
+    30_000,
+  );
+
+  // Inline mode has no memory cap of its own: on serverless an out-of-memory parse only ends that one invocation.
+  it.runIf(mode === "isolated")(
     "kills the parser once its memory passes the cap, even when the zip lies about its sizes",
     async () => {
       const bomb = await lyingZipBomb(768);
-      await expect(extractCvText(bomb, "docx")).rejects.toThrow(/memory limit exceeded/);
+      // Intentional: a few attempts. While the host is short of memory (the whole suite running in parallel) the
+      // OS compresses or swaps the child's pages as fast as it fills them, so its RSS never reaches the cap and
+      // JSZip's own size check rejects the file instead. A broken watchdog never reports the limit on any attempt.
+      const reasons: string[] = [];
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const err = (await extractCvText(bomb, "docx").catch((e: unknown) => e)) as Error;
+        reasons.push(err.message);
+        if (/memory limit exceeded/.test(err.message)) return;
+        expect(err.message).toMatch(/uncompressed data size mismatch/);
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+      expect.fail(`the memory watchdog never fired: ${reasons.join(" | ")}`);
     },
-    20_000,
+    90_000,
   );
 });
 
@@ -240,7 +257,8 @@ describe("normalizeText", () => {
     for (const input of [" ".repeat(40_000) + "x", "\t  ".repeat(40_000) + "x", "\n".repeat(200_000) + "x"]) {
       const started = performance.now();
       expect(normalizeText(input)).toBe("x");
-      expect(performance.now() - started).toBeLessThan(100);
+      // Quadratic behaviour on these inputs takes seconds; the margin absorbs a fully loaded test run.
+      expect(performance.now() - started).toBeLessThan(500);
     }
   });
 
@@ -267,7 +285,7 @@ describe("wordXmlText", () => {
     for (const xml of ["<".repeat(200_000), '<w:t a="'.repeat(50_000), "<w:t>" + "&amp".repeat(100_000), "<!--".repeat(100_000)]) {
       const started = performance.now();
       wordXmlText(xml);
-      expect(performance.now() - started).toBeLessThan(200);
+      expect(performance.now() - started).toBeLessThan(500);
     }
   });
 });
@@ -327,6 +345,78 @@ describe("runCvExtractor", () => {
     expect(keys.filter((k) => !k.startsWith("__CF_"))).toEqual(["NODE_ENV", "PATH"]);
   });
 });
+
+describe("runInlineExtractor", () => {
+  it("gives up on a parser that runs past the soft timeout", async () => {
+    const started = performance.now();
+    const never = () => new Promise<string>(() => {});
+    await expect(runInlineExtractor(Buffer.from("x"), "pdf", { timeoutMs: 50, extract: never })).rejects.toThrow(
+      "CV text extraction timed out after 0.05s",
+    );
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("rejects more than 1 MB of output", async () => {
+    const flood = async () => "é".repeat(600 * 1024);
+    await expect(runInlineExtractor(Buffer.from("x"), "txt", { timeoutMs: 10_000, extract: flood })).rejects.toThrow(
+      /too much output/,
+    );
+  });
+
+  it("reports the parser's reason on one short line", async () => {
+    const fail = async () => {
+      throw new Error(`bad\nfile ${"x".repeat(1000)}`);
+    };
+    const err = (await runInlineExtractor(Buffer.from("x"), "pdf", { timeoutMs: 10_000, extract: fail }).catch(
+      (e: unknown) => e,
+    )) as Error;
+    expect(err.message).toMatch(/^CV text extraction failed: bad file x+$/);
+    expect(err.message.length).toBeLessThan(350);
+  });
+});
+
+describe("extractionMode", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("is isolated on a normal server and inline on serverless platforms", () => {
+    expect(extractionMode()).toBe("isolated");
+    vi.stubEnv("NETLIFY", "true");
+    expect(extractionMode()).toBe("inline");
+    vi.stubEnv("NETLIFY", "");
+    vi.stubEnv("AWS_LAMBDA_FUNCTION_NAME", "handler");
+    expect(extractionMode()).toBe("inline");
+  });
+
+  it("follows CV_EXTRACTION, and ignores an unknown value", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubEnv("CV_EXTRACTION", "inline");
+    expect(extractionMode()).toBe("inline");
+    vi.stubEnv("NETLIFY", "true");
+    vi.stubEnv("CV_EXTRACTION", "isolated");
+    expect(extractionMode()).toBe("isolated");
+    vi.stubEnv("CV_EXTRACTION", "sandboxed");
+    expect(extractionMode()).toBe("inline");
+  });
+});
+
+/** Large inputs, built once and shared by both extraction modes. */
+const fixtures = {
+  declaredBomb: once(() => {
+    const para = "<w:p><w:r><w:t>Lorem ipsum dolor sit amet</w:t></w:r></w:p>";
+    return zipOf({ "word/document.xml": para.repeat(Math.ceil((21 * 1024 * 1024) / para.length)) });
+  }),
+  tooLargeInTotal: once(() => {
+    const big = "a".repeat(14 * 1024 * 1024);
+    return zipOf({ "word/document.xml": big, "word/a.xml": big, "word/b.xml": big });
+  }),
+};
+
+function once<T>(make: () => Promise<T>): () => Promise<T> {
+  let value: Promise<T> | undefined;
+  return () => (value ??= make());
+}
 
 async function zipOf(files: Record<string, string>): Promise<Buffer> {
   const zip = new JSZip();

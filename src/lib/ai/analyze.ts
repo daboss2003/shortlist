@@ -24,7 +24,13 @@ export class AiAnalysisError extends Error {
   }
 }
 
+/** Plain JSON (no Dates, no undefined), so it can be a durable step's result. */
 export type AnalyzeResult = { analysis: CvAnalysis; provider: AiProviderId; modelId: string };
+
+/** One provider's answer. `reason` is redacted and short: safe for logs and step results, not for employers. */
+export type ProviderAttempt = { ok: true; result: AnalyzeResult } | { ok: false; reason: string };
+
+export type AnalyzeInput = { cvText: string; job: Job };
 
 const TIMEOUT_MS = 120_000;
 const MAX_LISTED = 5;
@@ -33,43 +39,58 @@ const MAX_CHECKED_CHARS = 500;
 
 /** Extracts a profile and scores the CV against the job, trying each provider in order. */
 export async function analyzeCv(
-  input: { cvText: string; job: Job },
+  input: AnalyzeInput,
   chain: ResolvedProvider[] = resolveProviderChain().chain,
 ): Promise<AnalyzeResult> {
   if (chain.length === 0) throw new AiNotConfiguredError();
 
-  const { system, prompt } = buildAnalysisPrompt(input);
-
   for (const provider of chain) {
-    try {
-      // No `temperature`: some reasoning models reject it.
-      const result = await generateText({
-        model: provider.model,
-        instructions: system,
-        prompt,
-        output: Output.object({ schema: cvAnalysisSchema, name: "cv_analysis" }),
-        maxRetries: 2,
-        abortSignal: AbortSignal.timeout(TIMEOUT_MS),
-      });
-      return { analysis: sanitizeAnalysis(result.output), provider: provider.id, modelId: provider.modelId };
-    } catch (err) {
-      console.error(
-        `[ai] ${provider.id} (${provider.modelId}) failed: ${clip(redact(shortReason(err)), 200)} | ${clip(redact(errorMessage(err)), 500)}`,
-      );
-    }
+    const attempt = await analyzeCvWithProvider(input, provider);
+    if (attempt.ok) return attempt.result;
   }
 
   throw new AiAnalysisError();
+}
+
+/**
+ * One call to one provider (its own retries included, all within `timeoutMs`). Never throws: a failure is logged
+ * and returned as `{ ok: false }`, so a caller can move on to the next provider.
+ */
+export async function analyzeCvWithProvider(
+  input: AnalyzeInput,
+  provider: ResolvedProvider,
+  { timeoutMs = TIMEOUT_MS }: { timeoutMs?: number } = {},
+): Promise<ProviderAttempt> {
+  try {
+    const { system, prompt } = buildAnalysisPrompt(input);
+    // No `temperature`: some reasoning models reject it.
+    const result = await generateText({
+      model: provider.model,
+      instructions: system,
+      prompt,
+      output: Output.object({ schema: cvAnalysisSchema, name: "cv_analysis" }),
+      maxRetries: 2,
+      abortSignal: AbortSignal.timeout(timeoutMs),
+    });
+    return {
+      ok: true,
+      result: { analysis: sanitizeAnalysis(withoutNul(result.output)), provider: provider.id, modelId: provider.modelId },
+    };
+  } catch (err) {
+    const reason = clip(redact(shortReason(err, timeoutMs)), 200);
+    console.error(`[ai] ${provider.id} (${provider.modelId}) failed: ${reason} | ${clip(redact(errorMessage(err)), 500)}`);
+    return { ok: false, reason };
+  }
 }
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function shortReason(err: unknown): string {
-  if (RetryError.isInstance(err)) return shortReason(err.lastError);
+function shortReason(err: unknown, timeoutMs: number): string {
+  if (RetryError.isInstance(err)) return shortReason(err.lastError, timeoutMs);
   if (err instanceof Error && (err.name === "TimeoutError" || err.name === "AbortError")) {
-    return `timed out after ${TIMEOUT_MS / 1000}s`;
+    return `timed out after ${timeoutMs / 1000}s`;
   }
   if (NoObjectGeneratedError.isInstance(err)) return "the response didn't match the expected format";
   if (APICallError.isInstance(err) && err.statusCode) return `HTTP ${err.statusCode} ${err.message}`;
@@ -87,6 +108,16 @@ function clip(text: string, max: number): string {
 }
 
 // ── Post-processing: the model output is untrusted (the CV may contain prompt injection). ──
+
+/** Postgres text and jsonb columns reject NUL (U+0000), so one in the output would make the CV fail to save. */
+function withoutNul<T>(value: T): T {
+  if (typeof value === "string") return value.replaceAll("\u0000", "") as T;
+  if (Array.isArray(value)) return value.map(withoutNul) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, v]) => [key, withoutNul(v)])) as T;
+  }
+  return value;
+}
 
 function sanitizeAnalysis({ profile, evaluation }: CvAnalysis): CvAnalysis {
   const matchedSkills = cleanList(evaluation.matchedSkills);

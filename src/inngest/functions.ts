@@ -1,0 +1,63 @@
+import "server-only";
+import { cron } from "inngest";
+import { cvProcessRequested, inngest } from "@/inngest/client";
+import { withSafeErrors } from "@/lib/log";
+import { requeuePendingCandidates } from "@/lib/pipeline";
+import { GENERIC_FAILURE_MESSAGE, markFailed, runProcessCvSteps, type StepRunner } from "@/lib/pipeline/steps";
+import { purgeExpiredRateLimits } from "@/lib/rate-limit";
+import { purgeExpiredCandidateData } from "@/lib/retention";
+
+// Inngest functions, served by src/app/api/inngest/route.ts. Every step is its own HTTP invocation of that route
+// (checkpointing is off, see ./client), so each must finish inside Netlify's 60 s. The step bodies are plain
+// functions in src/lib/pipeline/steps.ts, tested without the Inngest runtime. Everything that can throw runs inside
+// withSafeErrors: Inngest stores a failed step's error, and a database error's message carries the query's data.
+
+/** Extract → reserve quota → analyze (one step per provider, falling back in order) → save, for one CV. */
+export const processCv = inngest.createFunction(
+  {
+    id: "process-cv",
+    triggers: [cvProcessRequested],
+    // At most 2 running steps per company, so one company's bulk upload can't take all of the free plan's 5
+    // concurrent steps and hold up every other company's CVs.
+    concurrency: [{ key: "event.data.companyId", limit: 2 }],
+    // Intentional: a newer request for the same CV (a re-score) cancels the older run, so a run that is analyzing
+    // against a job description the employer has since edited can't save over the new result. The claim step then
+    // takes over the row the cancelled run left "processing".
+    singleton: { key: "event.data.candidateId", mode: "cancel" },
+    retries: 3,
+    // Every retry of a step failed (storage or database down, the function killed at its time limit…): the CV is
+    // failed with a retry hint instead of staying "processing" forever.
+    onFailure: async ({ event, step }) => {
+      const { candidateId } = event.data.event.data;
+      await step.run("mark-failed", () => withSafeErrors(() => markFailed(candidateId, GENERIC_FAILURE_MESSAGE)));
+    },
+  },
+  async ({ event, step }) => runProcessCvSteps(event.data.candidateId, durableSteps(step)),
+);
+
+/** Every 30 minutes: re-sends CVs still pending (lost events, caps that reset at midnight UTC, a provider added). */
+export const requeuePending = inngest.createFunction(
+  { id: "requeue-pending", triggers: [cron("*/30 * * * *")], concurrency: 1 },
+  () => withSafeErrors(async () => ({ sent: await requeuePendingCandidates() })),
+);
+
+/** Hourly: candidate data past its retention period, and expired rate-limit counters. One batch per run. */
+export const retentionPurge = inngest.createFunction(
+  { id: "retention-purge", triggers: [cron("0 * * * *")], concurrency: 1 },
+  () =>
+    withSafeErrors(async () => ({
+      candidatesDeleted: await purgeExpiredCandidateData(),
+      rateLimitsDeleted: await purgeExpiredRateLimits(),
+    })),
+);
+
+export const functions = [processCv, requeuePending, retentionPurge];
+
+/** Adapts Inngest's `step` to the pipeline's StepRunner. */
+export function durableSteps(step: { run: (id: string, fn: () => Promise<unknown>) => Promise<unknown> }): StepRunner {
+  return {
+    // Intentional: the cast is sound because every step result is plain JSON (strings, numbers, booleans, null,
+    // arrays and objects of those), which Inngest's serialization round-trips unchanged.
+    run: <T>(id: string, fn: () => Promise<T>) => step.run(id, () => withSafeErrors(fn)) as Promise<T>,
+  };
+}

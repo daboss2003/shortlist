@@ -1,7 +1,8 @@
 export const CV_FILE_TYPES = ["pdf", "docx", "doc", "txt"] as const;
 export type CvFileType = (typeof CV_FILE_TYPES)[number];
 
-export const MAX_CV_BYTES = 5 * 1024 * 1024;
+// Intentional: 4 MB, not 5 — Netlify Functions accept ~4.5 MB of binary upload per request (6 MB base64-encoded).
+export const MAX_CV_BYTES = 4 * 1024 * 1024;
 
 export const CV_MIME_TYPES: Record<CvFileType, string> = {
   pdf: "application/pdf",

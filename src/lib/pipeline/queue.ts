@@ -1,4 +1,5 @@
 import "server-only";
+import { describeError } from "@/lib/log";
 
 type Deferred = { done: Promise<void>; resolve: () => void };
 type Task = Deferred & { running: boolean; rerun: Deferred | null };
@@ -84,7 +85,7 @@ export class TaskQueue {
       try {
         await this.worker(id);
       } catch (err) {
-        console.error(`[pipeline] worker crashed for ${id}:`, err instanceof Error ? err.message : err);
+        console.error(`[pipeline] worker crashed for ${id}:`, describeError(err));
       }
       if (!task.rerun) break;
       // Enqueued again while running: settle this run's callers, then go again in the same slot.

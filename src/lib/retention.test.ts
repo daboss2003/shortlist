@@ -1,12 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { candidates, companies, jobs } from "@/db/schema";
 import { createCandidateFromCv, validateCvUpload } from "@/lib/candidates/intake";
+import * as storage from "@/lib/storage";
 import { makeCompany, makeJob } from "../../test/factories";
-import { candidateDataDeletionDate, purgeExpiredCandidateData } from "./retention";
+import { candidateDataDeletionDate, getCompanyRetentionDays, purgeExpiredCandidateData } from "./retention";
 
 const DAY = 24 * 60 * 60 * 1000;
 const NOW = new Date("2027-01-01T00:00:00Z");
@@ -17,60 +18,118 @@ async function addCandidate(job: { id: string; companyId: string }, createdAt = 
   const bytes = Buffer.from(`%PDF-1.4\n% ${crypto.randomUUID()}\n`);
   const cv = await validateCvUpload(new File([new Uint8Array(bytes)], "cv.pdf"));
   const c = await createCandidateFromCv({ job, source: "upload", cv });
-  db.update(candidates).set({ createdAt }).where(eq(candidates.id, c.id)).run();
+  await db.update(candidates).set({ createdAt }).where(eq(candidates.id, c.id));
   return c;
 }
 
-function setup({ retentionDays = 90 as number | null, closedDaysAgo = null as number | null } = {}) {
-  const { company } = makeCompany();
-  db.update(companies).set({ retentionDays }).where(eq(companies.id, company.id)).run();
-  const job = makeJob(company.id, closedDaysAgo === null ? {} : { status: "closed", closedAt: daysAgo(closedDaysAgo) });
+async function setup({ retentionDays = 90 as number | null, closedDaysAgo = null as number | null } = {}) {
+  const { company } = await makeCompany();
+  await db.update(companies).set({ retentionDays }).where(eq(companies.id, company.id));
+  const job = await makeJob(company.id, closedDaysAgo === null ? {} : { status: "closed", closedAt: daysAgo(closedDaysAgo) });
   return { company, job };
 }
 
-const exists = (id: string) => !!db.select().from(candidates).where(eq(candidates.id, id)).get();
+const exists = async (id: string) => (await db.select().from(candidates).where(eq(candidates.id, id))).length > 0;
 const fileExists = (key: string) => fs.existsSync(path.join(process.env.UPLOAD_DIR!, key));
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("purgeExpiredCandidateData", () => {
   it("deletes candidate rows and CV files once the job has been closed longer than the retention period", async () => {
-    const { job } = setup({ closedDaysAgo: 91 });
+    const { job } = await setup({ closedDaysAgo: 91 });
     const c = await addCandidate(job);
 
     expect(await purgeExpiredCandidateData(NOW)).toBeGreaterThanOrEqual(1);
-    expect(exists(c.id)).toBe(false);
+    expect(await exists(c.id)).toBe(false);
     expect(fileExists(c.cvFileKey)).toBe(false);
-    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()).toBeTruthy();
+    expect(await db.select().from(jobs).where(eq(jobs.id, job.id))).toHaveLength(1);
   });
 
   it("keeps candidates of open jobs, of jobs still inside the period, and of companies with retention off", async () => {
-    const open = await addCandidate(setup().job);
-    const recent = await addCandidate(setup({ closedDaysAgo: 89 }).job);
-    const off = await addCandidate(setup({ retentionDays: null, closedDaysAgo: 1000 }).job);
+    const open = await addCandidate((await setup()).job);
+    const recent = await addCandidate((await setup({ closedDaysAgo: 89 })).job);
+    const off = await addCandidate((await setup({ retentionDays: null, closedDaysAgo: 1000 })).job);
 
     await purgeExpiredCandidateData(NOW);
-    expect(exists(open.id)).toBe(true);
-    expect(exists(recent.id)).toBe(true);
-    expect(exists(off.id)).toBe(true);
+    expect(await exists(open.id)).toBe(true);
+    expect(await exists(recent.id)).toBe(true);
+    expect(await exists(off.id)).toBe(true);
     expect(fileExists(off.cvFileKey)).toBe(true);
   });
 
   it("gives CVs added after the job closed their own full period", async () => {
-    const { job } = setup({ closedDaysAgo: 100 });
+    const { job } = await setup({ closedDaysAgo: 100 });
     const lateFresh = await addCandidate(job, daysAgo(10));
     const lateExpired = await addCandidate(job, daysAgo(95));
 
     await purgeExpiredCandidateData(NOW);
-    expect(exists(lateFresh.id)).toBe(true);
-    expect(exists(lateExpired.id)).toBe(false);
+    expect(await exists(lateFresh.id)).toBe(true);
+    expect(await exists(lateExpired.id)).toBe(false);
+  });
+
+  it("deletes exactly at the end of the period, not a moment before", async () => {
+    const { job } = await setup({ closedDaysAgo: 90 });
+    const c = await addCandidate(job);
+
+    await purgeExpiredCandidateData(new Date(NOW.getTime() - 1));
+    expect(await exists(c.id)).toBe(true);
+    await purgeExpiredCandidateData(NOW);
+    expect(await exists(c.id)).toBe(false);
   });
 
   it("applies each company's own retention period", async () => {
-    const short = await addCandidate(setup({ retentionDays: 30, closedDaysAgo: 31 }).job);
-    const long = await addCandidate(setup({ retentionDays: 180, closedDaysAgo: 31 }).job);
+    const short = await addCandidate((await setup({ retentionDays: 30, closedDaysAgo: 31 })).job);
+    const long = await addCandidate((await setup({ retentionDays: 180, closedDaysAgo: 31 })).job);
 
     await purgeExpiredCandidateData(NOW);
-    expect(exists(short.id)).toBe(false);
-    expect(exists(long.id)).toBe(true);
+    expect(await exists(short.id)).toBe(false);
+    expect(await exists(long.id)).toBe(true);
+  });
+
+  it("deletes at most `limit` candidates per run, oldest first, and the rest on the next run", async () => {
+    await purgeExpiredCandidateData(NOW);
+    const { job } = await setup({ closedDaysAgo: 400 });
+    const oldest = await addCandidate(job, daysAgo(300));
+    const middle = await addCandidate(job, daysAgo(250));
+    const newest = await addCandidate(job, daysAgo(200));
+
+    expect(await purgeExpiredCandidateData(NOW, { limit: 2 })).toBe(2);
+    expect([await exists(oldest.id), await exists(middle.id), await exists(newest.id)]).toEqual([false, false, true]);
+    expect(await purgeExpiredCandidateData(NOW, { limit: 2 })).toBe(1);
+    expect(await exists(newest.id)).toBe(false);
+  });
+
+  it("keeps the row of a CV whose file couldn't be deleted, so the next run retries it", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { job } = await setup({ closedDaysAgo: 91 });
+    const stuck = await addCandidate(job);
+    const fine = await addCandidate(job);
+    const realDelete = storage.deleteCvFile;
+    vi.spyOn(storage, "deleteCvFile").mockImplementation(async (key) => {
+      if (key === stuck.cvFileKey) throw new Error("storage unavailable");
+      return realDelete(key);
+    });
+
+    await purgeExpiredCandidateData(NOW);
+    expect(await exists(stuck.id)).toBe(true);
+    expect(await exists(fine.id)).toBe(false);
+
+    vi.mocked(storage.deleteCvFile).mockRestore();
+    await purgeExpiredCandidateData(NOW);
+    expect(await exists(stuck.id)).toBe(false);
+    expect(fileExists(stuck.cvFileKey)).toBe(false);
+  });
+});
+
+describe("getCompanyRetentionDays", () => {
+  it("is the company's setting, or null when off or the company is unknown", async () => {
+    const { company } = await setup({ retentionDays: 30 });
+    expect(await getCompanyRetentionDays(company.id)).toBe(30);
+    await db.update(companies).set({ retentionDays: null }).where(eq(companies.id, company.id));
+    expect(await getCompanyRetentionDays(company.id)).toBeNull();
+    expect(await getCompanyRetentionDays("no-such-company")).toBeNull();
   });
 });
 

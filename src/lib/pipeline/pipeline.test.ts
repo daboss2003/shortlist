@@ -14,6 +14,7 @@ import {
   startPendingRequeue,
   waitForIdle,
 } from "./index";
+import { rejectCvTextWrites } from "./test-helpers";
 
 const ai = vi.hoisted(() => ({ model: null as unknown }));
 
@@ -98,7 +99,7 @@ function promptText(prompt: Array<{ role: string; content: unknown }>): string {
 async function makeCandidate(
   opts: { text?: string; job?: Job; applicant?: { name: string; email: string; phone: string | null } } = {},
 ) {
-  const job = opts.job ?? makeJob(makeCompany().company.id);
+  const job = opts.job ?? (await makeJob((await makeCompany()).company.id));
   const cv = await validateCvUpload(new File([opts.text ?? CV_TEXT], "cv.txt", { type: "text/plain" }));
   return createCandidateFromCv({
     job,
@@ -108,9 +109,10 @@ async function makeCandidate(
   });
 }
 
-const reload = (id: string): Candidate => db.select().from(candidates).where(eq(candidates.id, id)).get()!;
-const setRow = (id: string, values: Partial<Candidate>) =>
-  db.update(candidates).set(values).where(eq(candidates.id, id)).run();
+const reload = async (id: string): Promise<Candidate> => (await db.select().from(candidates).where(eq(candidates.id, id)))[0];
+const setRow = async (id: string, values: Partial<Candidate>) => {
+  await db.update(candidates).set(values).where(eq(candidates.id, id));
+};
 
 beforeEach(() => {
   ai.model = workingModel();
@@ -131,7 +133,7 @@ describe("processCandidate", () => {
     const c = await makeCandidate();
     await processCandidate(c.id);
 
-    const row = reload(c.id);
+    const row = await reload(c.id);
     expect(row.status).toBe("ready");
     expect(row.error).toBeNull();
     expect(row.score).toBe(82);
@@ -150,14 +152,14 @@ describe("processCandidate", () => {
     expect(c.name).toBeNull();
     await processCandidate(c.id);
 
-    expect(reload(c.id)).toMatchObject({ name: "Jane Doe", email: "jane@example.com", phone: "+44 7700 900123" });
+    expect(await reload(c.id)).toMatchObject({ name: "Jane Doe", email: "jane@example.com", phone: "+44 7700 900123" });
   });
 
   it("never overwrites what a public applicant typed, but fills fields they left empty", async () => {
     const c = await makeCandidate({ applicant: { name: "Janet Typed", email: "janet@typed.example", phone: null } });
     await processCandidate(c.id);
 
-    expect(reload(c.id)).toMatchObject({
+    expect(await reload(c.id)).toMatchObject({
       status: "ready",
       name: "Janet Typed",
       email: "janet@typed.example",
@@ -171,7 +173,7 @@ describe("processCandidate", () => {
     const c = await makeCandidate({ text: "Jane Doe CV" });
     await processCandidate(c.id);
 
-    const row = reload(c.id);
+    const row = await reload(c.id);
     expect(row.status).toBe("failed");
     expect(row.error).toBe(
       "We couldn't read any text from this CV. It may be a scanned image — upload a text-based PDF or Word file.",
@@ -183,7 +185,7 @@ describe("processCandidate", () => {
     const c = await makeCandidate({ text: `${CV_TEXT}\n${"Built payment APIs in Node.js. ".repeat(5000)}` });
     await processCandidate(c.id);
 
-    const row = reload(c.id);
+    const row = await reload(c.id);
     expect(row.status).toBe("ready");
     expect(row.cvText).toHaveLength(100_000);
   });
@@ -197,7 +199,7 @@ describe("processCandidate", () => {
     const c = await makeCandidate();
     await processCandidate(c.id);
 
-    const row = reload(c.id);
+    const row = await reload(c.id);
     expect(row.status).toBe("failed");
     expect(row.error).toBe("The AI service couldn't analyze this CV right now. Try re-scoring it later.");
     expect(row.score).toBeNull();
@@ -210,13 +212,13 @@ describe("processCandidate", () => {
     const c = await makeCandidate();
     await processCandidate(c.id);
 
-    expect(reload(c.id)).toMatchObject({ status: "pending", error: null, attempts: 0, cvText: null });
+    expect(await reload(c.id)).toMatchObject({ status: "pending", error: null, attempts: 0, cvText: null });
 
     // Once a provider is configured (and the server restarts), recovery processes it.
     ai.model = workingModel();
     await recoverInterruptedCandidates();
     await waitForIdle();
-    expect(reload(c.id).status).toBe("ready");
+    expect((await reload(c.id)).status).toBe("ready");
   });
 
   it("is a no-op for a candidate that isn't pending", async () => {
@@ -224,12 +226,31 @@ describe("processCandidate", () => {
     ai.model = model;
     const c = await makeCandidate();
     await processCandidate(c.id);
-    const before = reload(c.id);
+    const before = await reload(c.id);
 
     await processCandidate(c.id);
 
     expect(model.doGenerateCalls).toHaveLength(1);
-    expect(reload(c.id)).toEqual(before);
+    expect(await reload(c.id)).toEqual(before);
+  });
+
+  it("logs a database failure without the query's data (here, the CV text)", async () => {
+    const errorLog = vi.mocked(console.error);
+    const c = await makeCandidate({ text: `${CV_TEXT}\nSECRET-MARKER private reference` });
+    const restore = await rejectCvTextWrites();
+    try {
+      await processCandidate(c.id);
+    } finally {
+      await restore();
+    }
+
+    expect(await reload(c.id)).toMatchObject({
+      status: "failed",
+      error: "Something went wrong while analyzing this CV. Try re-scoring it.",
+    });
+    const logged = errorLog.mock.calls.map((args) => args.join(" ")).join("\n");
+    expect(logged).toContain("cv text rejected by test trigger");
+    expect(logged).not.toContain("SECRET-MARKER");
   });
 
   it("never throws, even for an unknown id", async () => {
@@ -244,8 +265,8 @@ describe("daily AI quota", () => {
     vi.stubEnv("AI_DAILY_LIMIT", "1");
     const model = workingModel();
     ai.model = model;
-    const { company } = makeCompany();
-    const job = makeJob(company.id);
+    const { company } = await makeCompany();
+    const job = await makeJob(company.id);
     const first = await makeCandidate({ job, text: `${CV_TEXT}\nFirst` });
     const second = await makeCandidate({ job, text: `${CV_TEXT}\nSecond` });
     const otherCompany = await makeCandidate();
@@ -254,25 +275,25 @@ describe("daily AI quota", () => {
     await processCandidate(second.id);
     await processCandidate(otherCompany.id);
 
-    expect(reload(first.id).status).toBe("ready");
-    expect(reload(second.id)).toMatchObject({ status: "pending", error: null, attempts: 0 });
-    expect(reload(otherCompany.id).status).toBe("ready");
+    expect((await reload(first.id)).status).toBe("ready");
+    expect(await reload(second.id)).toMatchObject({ status: "pending", error: null, attempts: 0 });
+    expect((await reload(otherCompany.id)).status).toBe("ready");
     expect(model.doGenerateCalls).toHaveLength(2);
-    expect(getAiQuota(company.id)).toMatchObject({ used: 1, remaining: 0 });
+    expect(await getAiQuota(company.id)).toMatchObject({ used: 1, remaining: 0 });
 
     vi.setSystemTime(new Date("2026-10-08T00:00:01Z"));
     await processCandidate(second.id);
-    expect(reload(second.id)).toMatchObject({ status: "ready", attempts: 1 });
+    expect(await reload(second.id)).toMatchObject({ status: "ready", attempts: 1 });
   });
 
   it("doesn't charge the cap for a CV that can't be read", async () => {
     ai.model = workingModel();
-    const { company } = makeCompany();
-    const c = await makeCandidate({ job: makeJob(company.id), text: "Jane Doe CV" });
+    const { company } = await makeCompany();
+    const c = await makeCandidate({ job: await makeJob(company.id), text: "Jane Doe CV" });
     await processCandidate(c.id);
 
-    expect(reload(c.id).status).toBe("failed");
-    expect(getAiQuota(company.id).used).toBe(0);
+    expect((await reload(c.id)).status).toBe("failed");
+    expect((await getAiQuota(company.id)).used).toBe(0);
   });
 });
 
@@ -294,21 +315,21 @@ describe("re-score while processing", () => {
     ai.model = model;
     const c = await makeCandidate();
 
-    scheduleCandidateProcessing([c.id]);
+    await scheduleCandidateProcessing([c.id]);
     await started;
-    expect(reload(c.id).status).toBe("processing");
+    expect((await reload(c.id)).status).toBe("processing");
 
     // What markForRescore does, after the employer edited the job.
-    db.update(jobs).set({ title: "Staff Platform Engineer" }).where(eq(jobs.id, c.jobId)).run();
-    setRow(c.id, { status: "pending", error: null, attempts: 0 });
-    scheduleCandidateProcessing([c.id]);
+    await db.update(jobs).set({ title: "Staff Platform Engineer" }).where(eq(jobs.id, c.jobId));
+    await setRow(c.id, { status: "pending", error: null, attempts: 0 });
+    await scheduleCandidateProcessing([c.id]);
 
     releaseFirst();
     await waitForIdle();
 
     expect(model.doGenerateCalls).toHaveLength(2);
     expect(promptText(model.doGenerateCalls[1].prompt)).toContain("Staff Platform Engineer");
-    expect(reload(c.id)).toMatchObject({ status: "ready", score: 91, attempts: 1 });
+    expect(await reload(c.id)).toMatchObject({ status: "ready", score: 91, attempts: 1 });
   });
 
   it("doesn't let a superseded run mark the candidate failed", async () => {
@@ -327,11 +348,11 @@ describe("re-score while processing", () => {
 
     const run = processCandidate(c.id);
     await started;
-    setRow(c.id, { status: "pending", error: null, attempts: 0 });
+    await setRow(c.id, { status: "pending", error: null, attempts: 0 });
     releaseFirst();
     await run;
 
-    expect(reload(c.id)).toMatchObject({ status: "pending", error: null });
+    expect(await reload(c.id)).toMatchObject({ status: "pending", error: null });
   });
 });
 
@@ -341,30 +362,37 @@ describe("scheduleCandidateProcessing", () => {
     ai.model = model;
     const c = await makeCandidate();
 
-    scheduleCandidateProcessing([c.id, c.id]);
-    scheduleCandidateProcessing([c.id]);
-    expect(reload(c.id).status).not.toBe("ready");
+    await scheduleCandidateProcessing([c.id, c.id]);
+    await scheduleCandidateProcessing([c.id]);
+    expect((await reload(c.id)).status).not.toBe("ready");
 
     await waitForIdle();
-    expect(reload(c.id).status).toBe("ready");
+    expect((await reload(c.id)).status).toBe("ready");
     expect(model.doGenerateCalls).toHaveLength(1);
   });
 
   it("runs at most AI_CONCURRENCY (default 3) analyses at once", async () => {
-    ai.model = workingModel(20);
+    ai.model = workingModel(50);
     vi.stubEnv("AI_CONCURRENCY", "");
-    const ids = await Promise.all(Array.from({ length: 6 }, () => makeCandidate().then((c) => c.id)));
+    // Text already extracted (as for a re-score): child-process start-up jitter would otherwise keep the AI calls
+    // from overlapping on a loaded machine, and this test is about the queue's limit.
+    const withText = async () => {
+      const c = await makeCandidate();
+      await setRow(c.id, { cvText: CV_TEXT });
+      return c.id;
+    };
+    const ids = await Promise.all(Array.from({ length: 6 }, withText));
 
-    scheduleCandidateProcessing(ids);
+    await scheduleCandidateProcessing(ids);
     await waitForIdle();
 
-    expect(ids.map((id) => reload(id).status)).toEqual(Array(6).fill("ready"));
+    expect(await Promise.all(ids.map(async (id) => (await reload(id)).status))).toEqual(Array(6).fill("ready"));
     expect(maxInFlight).toBe(3);
 
     vi.stubEnv("AI_CONCURRENCY", "2");
     maxInFlight = 0;
-    const more = await Promise.all(Array.from({ length: 4 }, () => makeCandidate().then((c) => c.id)));
-    scheduleCandidateProcessing(more);
+    const more = await Promise.all(Array.from({ length: 4 }, withText));
+    await scheduleCandidateProcessing(more);
     await waitForIdle();
     expect(maxInFlight).toBe(2);
   });
@@ -378,14 +406,14 @@ describe("scheduleCandidateProcessing", () => {
         return modelResult();
       },
     });
-    const jobA = makeJob(makeCompany().company.id);
-    const jobB = makeJob(makeCompany().company.id);
+    const jobA = await makeJob((await makeCompany()).company.id);
+    const jobB = await makeJob((await makeCompany()).company.id);
     const batchA = [];
     for (let i = 1; i <= 10; i++) batchA.push((await makeCandidate({ job: jobA, text: `${CV_TEXT}\nMarker A${i}` })).id);
     const b = await makeCandidate({ job: jobB, text: `${CV_TEXT}\nMarker B1` });
 
-    scheduleCandidateProcessing(batchA);
-    scheduleCandidateProcessing([b.id]);
+    await scheduleCandidateProcessing(batchA);
+    await scheduleCandidateProcessing([b.id]);
     await waitForIdle();
 
     expect(order).toHaveLength(11);
@@ -395,9 +423,9 @@ describe("scheduleCandidateProcessing", () => {
 
   it("skips ids that no longer exist", async () => {
     const c = await makeCandidate();
-    expect(() => scheduleCandidateProcessing(["gone", c.id])).not.toThrow();
+    await expect(scheduleCandidateProcessing(["gone", c.id])).resolves.toBeUndefined();
     await waitForIdle();
-    expect(reload(c.id).status).toBe("ready");
+    expect((await reload(c.id)).status).toBe("ready");
   });
 });
 
@@ -405,25 +433,25 @@ describe("recoverInterruptedCandidates", () => {
   it("re-queues candidates left processing or pending by a previous process", async () => {
     const interrupted = await makeCandidate();
     const queued = await makeCandidate();
-    setRow(interrupted.id, { status: "processing", attempts: 2 });
+    await setRow(interrupted.id, { status: "processing", attempts: 2 });
 
     await recoverInterruptedCandidates();
     await waitForIdle();
 
-    expect(reload(interrupted.id)).toMatchObject({ status: "ready", attempts: 3 });
-    expect(reload(queued.id).status).toBe("ready");
+    expect(await reload(interrupted.id)).toMatchObject({ status: "ready", attempts: 3 });
+    expect((await reload(queued.id)).status).toBe("ready");
   });
 
   it("gives up on a CV that was mid-processing on each of its last 3 attempts, so it can't crash-loop the server", async () => {
     const model = workingModel();
     ai.model = model;
     const crashing = await makeCandidate();
-    setRow(crashing.id, { status: "processing", attempts: 3 });
+    await setRow(crashing.id, { status: "processing", attempts: 3 });
 
     await recoverInterruptedCandidates();
     await waitForIdle();
 
-    expect(reload(crashing.id)).toMatchObject({
+    expect(await reload(crashing.id)).toMatchObject({
       status: "failed",
       error: "We couldn't process this CV. Try re-scoring it, or ask the candidate for a different file.",
     });
@@ -431,7 +459,7 @@ describe("recoverInterruptedCandidates", () => {
   });
 
   it("is safe when there is nothing to recover", async () => {
-    db.delete(candidates).run();
+    await db.delete(candidates);
     await expect(recoverInterruptedCandidates()).resolves.toBeUndefined();
     await waitForIdle();
   });
@@ -450,15 +478,15 @@ describe("startPendingRequeue", () => {
       expect(setIntervalSpy).toHaveBeenCalledTimes(1);
 
       await waitForIdle();
-      expect(reload(c.id).status).toBe("pending");
+      expect((await reload(c.id)).status).toBe("pending");
 
       vi.advanceTimersByTime(5 * 60 * 1000 - 1);
       await waitForIdle();
-      expect(reload(c.id).status).toBe("pending");
+      expect((await reload(c.id)).status).toBe("pending");
 
       vi.advanceTimersByTime(1);
       await waitForIdle();
-      expect(reload(c.id).status).toBe("ready");
+      expect((await reload(c.id)).status).toBe("ready");
     } finally {
       clearInterval(g.__cvPendingRequeueTimer);
       delete g.__cvPendingRequeueTimer;

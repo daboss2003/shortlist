@@ -2,7 +2,7 @@ import { MockLanguageModelV4 } from "ai/test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Job } from "@/db/schema";
 import type { CvAnalysis } from "@/lib/ai/schemas";
-import { AiAnalysisError, AiNotConfiguredError, analyzeCv } from "./analyze";
+import { AiAnalysisError, AiNotConfiguredError, analyzeCv, analyzeCvWithProvider } from "./analyze";
 import { RECOMMENDATION_MIN_SCORES, buildAnalysisPrompt } from "./prompt";
 import type { ResolvedProvider } from "./providers";
 
@@ -209,6 +209,20 @@ describe("analyzeCv", () => {
     expect(result.analysis.evaluation.recommendation).toBe(expected);
   });
 
+  it("removes NUL characters, which Postgres can't store, from every field", async () => {
+    const model = mockModel(
+      analysis({
+        profile: { fullName: "Jane\u0000 Doe", skills: ["Node\u0000.js"], experience: [{ title: "Eng\u0000", company: "X", startDate: null, endDate: null, description: "a\u0000b" }] },
+        evaluation: { summary: "Fit\u0000.", strengths: ["\u0000"] },
+      }),
+    );
+    const result = await analyzeCv({ cvText, job }, [provider("gemini", "Google Gemini", model)]);
+    expect(JSON.stringify(result)).not.toContain("\\u0000");
+    expect(result.analysis.profile).toMatchObject({ fullName: "Jane Doe", skills: ["Node.js"] });
+    expect(result.analysis.profile.experience[0]).toMatchObject({ title: "Eng", description: "ab" });
+    expect(result.analysis.evaluation).toMatchObject({ summary: "Fit.", strengths: [] });
+  });
+
   it("drops emails and links too long to be real", async () => {
     const model = mockModel(
       analysis({
@@ -237,6 +251,43 @@ describe("analyzeCv", () => {
     expect(userText).toContain(`<cv>\n${cvText}\n</cv>`);
     expect(call.responseFormat).toMatchObject({ type: "json" });
     expect(call.temperature).toBeUndefined();
+  });
+});
+
+describe("analyzeCvWithProvider", () => {
+  it("returns the post-processed analysis and which provider answered", async () => {
+    const attempt = await analyzeCvWithProvider(
+      { cvText, job },
+      provider("openai", "OpenAI", mockModel(analysis({ evaluation: { overallScore: 140 } }))),
+    );
+    expect(attempt).toMatchObject({ ok: true, result: { provider: "openai", modelId: "openai-model" } });
+    expect(attempt.ok && attempt.result.analysis.evaluation).toMatchObject({ overallScore: 100, recommendation: "strong_fit" });
+    // A durable step stores its result as JSON; nothing may be lost in the round trip.
+    expect(JSON.parse(JSON.stringify(attempt))).toEqual(attempt);
+  });
+
+  it("never throws: a failure comes back with a short, redacted reason", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const attempt = await analyzeCvWithProvider(
+      { cvText, job },
+      provider("gemini", "Google Gemini", failingModel(`bad key sk-proj-abcdefghijklmnopqrstuvwxyz ${"x".repeat(500)}`)),
+    );
+    expect(attempt.ok).toBe(false);
+    const reason = attempt.ok ? "" : attempt.reason;
+    expect(reason).toMatch(/^bad key \[redacted\] x+…$/);
+    expect(reason.length).toBeLessThanOrEqual(200);
+  });
+
+  it("gives up after its own timeout", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const hanging = new MockLanguageModelV4({
+      doGenerate: ({ abortSignal }) =>
+        new Promise((_, reject) => abortSignal?.addEventListener("abort", () => reject(abortSignal.reason))),
+    });
+    const started = performance.now();
+    const attempt = await analyzeCvWithProvider({ cvText, job }, provider("groq", "Groq", hanging), { timeoutMs: 50 });
+    expect(attempt).toEqual({ ok: false, reason: "timed out after 0.05s" });
+    expect(performance.now() - started).toBeLessThan(2000);
   });
 });
 
