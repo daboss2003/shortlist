@@ -130,13 +130,18 @@ export const candidates = pgTable(
     // Pipeline claims since the last (re)score request. Recovery gives up after a few, so one CV that keeps
     // failing can't be retried forever.
     attempts: integer("attempts").notNull().default(0),
+    // Set by the run that claims the CV (pending → processing). The token makes every later write conditional on
+    // still being *that* run's claim (a superseded or failed older run can't overwrite a newer one); claimed_at lets
+    // the requeue cron recover rows stuck in "processing" after an outage.
+    claimToken: text("claim_token"),
+    claimedAt: ts("claimed_at"),
     createdAt: createdAt(),
     processedAt: ts("processed_at"),
   },
   (t) => [
     index("candidates_job_score_idx").on(t.jobId, t.score),
     index("candidates_company_idx").on(t.companyId),
-    index("candidates_status_idx").on(t.status),
+    index("candidates_status_idx").on(t.status, t.claimedAt),
     // One public application per email per job. Employer uploads are exempt (duplicates are their call).
     uniqueIndex("candidates_public_job_email_uq")
       .on(t.jobId, t.email)

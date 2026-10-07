@@ -1,6 +1,6 @@
 // The CV text extraction itself, shared by both extraction modes (src/lib/cv/extract-text.ts):
 // - isolated: scripts/extract-cv-text.mjs runs this in a short-lived, memory-capped child process;
-// - inline: serverless functions import it directly (each invocation is already its own sandbox).
+// - inline: src/lib/cv/extract-text.ts imports it directly, with time and output caps (serverless).
 // Plain ESM on purpose: the isolated child runs it directly under node, outside the Next/TS toolchain.
 
 const MAX_OUTPUT_CHARS = 200_000;

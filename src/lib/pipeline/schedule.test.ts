@@ -2,12 +2,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { db } from "@/db";
 import { aiUsage, candidates, type Job } from "@/db/schema";
 import { makeCompany, makeJob } from "../../../test/factories";
-import { findRequeueCandidates, requeuePendingCandidates, scheduleCandidateProcessing, waitForIdle } from "./index";
+import {
+  findRequeueCandidates,
+  processEventId,
+  requeuePendingCandidates,
+  scheduleCandidateProcessing,
+  waitForIdle,
+} from "./index";
 import { executionMode } from "./runtime";
-import { CV_TEXT, makeCandidate, reload, setRow, workingModel } from "./test-helpers";
+import { claimStep, runProcessCvSteps, type StepRunner } from "./steps";
+import { CV_TEXT, makeCandidate, providerWith, reload, setRow, workingModel } from "./test-helpers";
 
 const mocks = vi.hoisted(() => ({
-  send: vi.fn<(rows: Array<{ id: string; companyId: string }>, opts?: { dedupeKey?: string }) => Promise<void>>(),
+  send: vi.fn<(rows: Array<{ id: string; companyId: string; eventId: string }>) => Promise<void>>(),
   model: null as unknown,
 }));
 
@@ -22,6 +29,21 @@ vi.mock("@/lib/ai/providers", () => ({
 const NOW = new Date("2026-10-07T12:00:00Z");
 const minutesAgo = (n: number) => new Date(NOW.getTime() - n * 60_000);
 const sentIds = () => mocks.send.mock.calls.flatMap(([rows]) => rows.map((r) => r.id));
+const sentEventIds = () => mocks.send.mock.calls.flatMap(([rows]) => rows.map((r) => r.eventId));
+const inline: StepRunner = { run: (_id, fn) => fn() };
+
+/** A CV left "processing" by a run claimed `ageMinutes` before NOW (null: claimed before claims were timed). */
+async function processingCandidate(job: Job, ageMinutes: number | null, claimToken: string | null = "run-0") {
+  const c = await makeCandidate({ job, text: `${CV_TEXT}\n${crypto.randomUUID()}` });
+  await setRow(c.id, {
+    createdAt: minutesAgo(120),
+    status: "processing",
+    attempts: 1,
+    claimToken,
+    claimedAt: ageMinutes == null ? null : minutesAgo(ageMinutes),
+  });
+  return c;
+}
 
 /** A pending candidate created `ageMinutes` before NOW. */
 async function pendingCandidate(job: Job, ageMinutes: number) {
@@ -30,8 +52,8 @@ async function pendingCandidate(job: Job, ageMinutes: number) {
   return c;
 }
 
-async function usedToday(companyId: string, analyses: number) {
-  await db.insert(aiUsage).values({ companyId, day: "2026-10-07", analyses });
+async function usedToday(companyId: string, analyses: number, day: Date = NOW) {
+  await db.insert(aiUsage).values({ companyId, day: day.toISOString().slice(0, 10), analyses });
 }
 
 beforeEach(async () => {
@@ -77,14 +99,95 @@ describe("scheduleCandidateProcessing with Inngest", () => {
 
     expect(mocks.send).toHaveBeenCalledTimes(1);
     expect(mocks.send.mock.calls[0][0]).toEqual([
-      { id: b.id, companyId: b.companyId },
-      { id: a.id, companyId: a.companyId },
+      { id: b.id, companyId: b.companyId, eventId: `cv-${b.id}-new` },
+      { id: a.id, companyId: a.companyId, eventId: `cv-${a.id}-new` },
     ]);
-    // No re-queue dedupe id: a re-score must always get a fresh run.
-    expect(mocks.send.mock.calls[0][1]).toBeUndefined();
     // Nothing runs in this process.
     await waitForIdle();
     expect((await reload(a.id)).status).toBe("pending");
+  });
+
+  it("sends no more CVs per company than its remaining AI allowance today; the rest stay pending", async () => {
+    vi.stubEnv("AI_DAILY_LIMIT", "3");
+    const partly = await makeJob((await makeCompany()).company.id);
+    const capped = await makeJob((await makeCompany()).company.id);
+    const fresh = await makeJob((await makeCompany()).company.id);
+    await usedToday(partly.companyId, 2, new Date());
+    await usedToday(capped.companyId, 3, new Date());
+    const partlyCvs = [await pendingCandidate(partly, 0), await pendingCandidate(partly, 0)];
+    const cappedCv = await pendingCandidate(capped, 0);
+    const freshCvs = [await pendingCandidate(fresh, 0), await pendingCandidate(fresh, 0)];
+
+    await scheduleCandidateProcessing([...partlyCvs, cappedCv, ...freshCvs].map((c) => c.id));
+
+    // 1 slot left: only the first; none for the capped company; both for the fresh one.
+    expect(sentIds()).toEqual([partlyCvs[0].id, ...freshCvs.map((c) => c.id)]);
+    expect((await reload(partlyCvs[1].id)).status).toBe("pending");
+    expect((await reload(cappedCv.id)).status).toBe("pending");
+  });
+
+  it("sends nothing for a company that has used today's cap", async () => {
+    vi.stubEnv("AI_DAILY_LIMIT", "1");
+    const job = await makeJob((await makeCompany()).company.id);
+    await usedToday(job.companyId, 1, new Date());
+
+    await scheduleCandidateProcessing([(await makeCandidate({ job })).id]);
+    expect(sentIds()).toEqual([]);
+  });
+
+  it("sends every CV when the cap is off", async () => {
+    vi.stubEnv("AI_DAILY_LIMIT", "0");
+    const job = await makeJob((await makeCompany()).company.id);
+    await usedToday(job.companyId, 10_000, new Date());
+    const cvs = [await makeCandidate({ job }), await makeCandidate({ job, text: `${CV_TEXT}\nTwo` })];
+
+    await scheduleCandidateProcessing(cvs.map((c) => c.id));
+    expect(sentIds()).toEqual(cvs.map((c) => c.id));
+  });
+
+  it("sends nothing while no AI provider is configured; the re-queue sends it once one is", async () => {
+    mocks.model = null;
+    const c = await makeCandidate();
+
+    await scheduleCandidateProcessing([c.id]);
+    expect(mocks.send).not.toHaveBeenCalled();
+    expect((await reload(c.id)).status).toBe("pending");
+  });
+
+  it("gives a CV's first event the id its re-queue uses, so Inngest drops the re-queue of a queued CV", async () => {
+    const c = await pendingCandidate(await makeJob((await makeCompany()).company.id), 60);
+
+    await scheduleCandidateProcessing([c.id]);
+    await requeuePendingCandidates(NOW);
+
+    expect(sentIds()).toEqual([c.id, c.id]);
+    const [first, requeue] = sentEventIds();
+    expect(requeue).toBe(first);
+  });
+
+  it("gives a re-scored CV a new event id, so it always runs again, and keeps it until the CV is claimed", async () => {
+    const c = await makeCandidate();
+    await scheduleCandidateProcessing([c.id]);
+    // Its run claims and scores it.
+    expect(await runProcessCvSteps(c.id, "run-1", inline, [providerWith("gemini", workingModel())])).toBe("ready");
+
+    // What markForRescore does, twice before the next run claims the CV.
+    await setRow(c.id, { status: "pending", error: null, attempts: 0 });
+    await scheduleCandidateProcessing([c.id]);
+    await setRow(c.id, { status: "pending", error: null, attempts: 0 });
+    await scheduleCandidateProcessing([c.id]);
+
+    // The next run claims it; it hits the cap and goes back to pending; the employer re-scores again.
+    await claimStep(c.id, "run-2");
+    await setRow(c.id, { status: "pending", error: null, attempts: 0 });
+    await scheduleCandidateProcessing([c.id]);
+
+    const [first, rescore, rescoreAgain, afterRun2] = sentEventIds();
+    expect(rescore).not.toBe(first);
+    // The second re-score shares the queued run's id: that run reads the current job when it analyzes.
+    expect(rescoreAgain).toBe(rescore);
+    expect(afterRun2).not.toBe(rescore);
+    expect(new Set([first, rescore, afterRun2]).size).toBe(3);
   });
 
   it("doesn't throw when Inngest can't be reached; the CV stays pending for the re-queue", async () => {
@@ -136,7 +239,47 @@ describe("requeuePendingCandidates", () => {
 
     expect(sentIds()).toEqual([older.id, old.id]);
     expect(sentIds()).not.toContain(fresh.id);
-    expect(mocks.send.mock.calls[0][1]).toEqual({ dedupeKey: "requeue-2026-10-07" });
+    expect(sentEventIds()).toEqual([processEventId(older.id, null), processEventId(old.id, null)]);
+  });
+
+  it("re-sends a CV stuck processing since a claim over 30 minutes old, but not one claimed recently", async () => {
+    const job = await makeJob((await makeCompany()).company.id);
+    const stuck = await processingCandidate(job, 31, "run-0");
+    const legacy = await processingCandidate(job, null, null);
+    const working = await processingCandidate(job, 10, "run-9");
+
+    expect(await requeuePendingCandidates(NOW)).toBe(2);
+
+    expect(sentIds()).toEqual(expect.arrayContaining([stuck.id, legacy.id]));
+    expect(sentIds()).not.toContain(working.id);
+    // Its own id, once per stuck claim: not the id that started the stuck run.
+    const ids = Object.fromEntries(mocks.send.mock.calls[0][0].map((r) => [r.id, r.eventId]));
+    expect(ids[stuck.id]).toBe(`cv-${stuck.id}-run-0-stale`);
+    expect(ids[stuck.id]).not.toBe(processEventId(stuck.id, "run-0"));
+  });
+
+  it("lets the re-sent run take the stuck CV over and finish it", async () => {
+    const job = await makeJob((await makeCompany()).company.id);
+    const stuck = await processingCandidate(job, 45, "run-0");
+    await requeuePendingCandidates(NOW);
+    expect(sentIds()).toEqual([stuck.id]);
+
+    // The run the re-sent event starts.
+    expect(await runProcessCvSteps(stuck.id, "run-1", inline, [providerWith("gemini", workingModel())])).toBe("ready");
+    expect(await reload(stuck.id)).toMatchObject({ status: "ready", attempts: 2, score: 82 });
+  });
+
+  it("counts stuck CVs against the company's remaining allowance, like pending ones", async () => {
+    vi.stubEnv("AI_DAILY_LIMIT", "2");
+    const job = await makeJob((await makeCompany()).company.id);
+    await usedToday(job.companyId, 1);
+    const stuck = await processingCandidate(job, 60);
+    const pending = await pendingCandidate(job, 30);
+
+    await requeuePendingCandidates(NOW);
+    // Oldest first: the stuck CV (created 2 hours ago) takes the one slot left.
+    expect(sentIds()).toEqual([stuck.id]);
+    expect(sentIds()).not.toContain(pending.id);
   });
 
   it("skips companies that have used today's cap, and sends no more than each company has left", async () => {

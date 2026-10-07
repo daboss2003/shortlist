@@ -3,9 +3,10 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import type { CvFileType } from "@/lib/cv/file-type";
 import { isNetlify } from "@/lib/pipeline/runtime";
+import { extractText as extractWithCore } from "./extract-core.mjs";
 
 const ISOLATED_TIMEOUT_MS = 30_000;
-// A soft limit, well under Netlify's 60 s hard limit, so a slow file fails the step instead of killing it.
+// Well under Netlify's 60 s hard limit, so a slow file fails the step instead of the platform killing it.
 const INLINE_TIMEOUT_MS = 40_000;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_STDERR_CHARS = 4000;
@@ -15,7 +16,7 @@ const MAX_STDERR_CHARS = 4000;
  * - "isolated": a separate, memory- and time-limited node process (scripts/extract-cv-text.mjs), so a malicious
  *   file can't freeze or crash a long-lived server. Default on a normal server.
  * - "inline": in this process, with time and output caps. Default on serverless (Netlify, AWS Lambda), where each
- *   invocation is already isolated and can't spawn a capped child reliably.
+ *   invocation is already isolated and a spawned script's dependencies aren't reliably shipped with the function.
  * Both run the same code (src/lib/cv/extract-core.mjs).
  */
 export type ExtractionMode = "isolated" | "inline";
@@ -45,42 +46,42 @@ export async function extractCvText(
   return runCvExtractor(bytes, fileType, { scriptPath: extractorScript(), timeoutMs: ISOLATED_TIMEOUT_MS });
 }
 
-type Extract = (bytes: Buffer, fileType: CvFileType) => Promise<string>;
+/** Parses one CV. Replaceable so tests can simulate slow or oversized parses. */
+export type InlineExtract = (bytes: Buffer, fileType: CvFileType) => Promise<string>;
 
 /**
- * Inline mode: the shared extractor in this process, with the isolated mode's output cap and a soft timeout.
- * `extract` is replaceable so tests can exercise the caps.
+ * Inline mode: the shared extractor in this thread, with a timeout and the isolated mode's output cap.
+ *
+ * Intentional: not a worker thread. Turbopack ships `new Worker(new URL("./x.mjs", import.meta.url))` as an unbundled
+ * asset whose own imports (extract-core.mjs and the parser packages) don't resolve in the built server — verified
+ * against `next build`: every CV failed. A static import is bundled and traced like the rest of the server, so it
+ * works on Netlify. The trade-off: a parse that loses the timeout race can't be killed and runs on until it finishes;
+ * the 4 MB upload cap, the DOCX expansion guard and the output caps bound how long and how much that can be.
  */
 export async function runInlineExtractor(
   bytes: Buffer,
   fileType: CvFileType,
-  { timeoutMs, extract = extractWithCore }: { timeoutMs: number; extract?: Extract },
+  { timeoutMs, extract = extractWithCore }: { timeoutMs: number; extract?: InlineExtract },
 ): Promise<string> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`CV text extraction timed out after ${timeoutMs / 1000}s`)), timeoutMs);
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(`CV text extraction timed out after ${timeoutMs / 1000}s`)), timeoutMs);
   });
   try {
-    // Intentional: the parse isn't cancelled when the timeout wins (in-process work can't be killed); it finishes
-    // or dies with this invocation. The race only stops the caller from waiting into the platform's hard limit.
-    const text = await Promise.race([
-      extract(bytes, fileType).catch((err: unknown) => {
-        const reason = err instanceof Error ? err.message : String(err);
-        throw new Error(`CV text extraction failed: ${reason.replace(/\s+/g, " ").slice(0, 300)}`);
-      }),
-      timeout,
-    ]);
+    const text = await Promise.race([extract(bytes, fileType), timedOut]);
     if (Buffer.byteLength(text, "utf8") > MAX_OUTPUT_BYTES) throw new Error("CV text extraction produced too much output");
     return text;
+  } catch (err) {
+    if (err instanceof TimeoutError) throw err;
+    const reason = err instanceof Error ? err.message : String(err);
+    if (reason.startsWith("CV text extraction")) throw err;
+    throw new Error(`CV text extraction failed: ${reason.replace(/\s+/g, " ").slice(0, 300)}`);
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function extractWithCore(bytes: Buffer, fileType: CvFileType): Promise<string> {
-  const { extractText } = await import("./extract-core.mjs");
-  return extractText(bytes, fileType);
-}
+class TimeoutError extends Error {}
 
 /** Isolated mode: the process plumbing behind extractCvText. Exported so tests can point it at a stub script. */
 export function runCvExtractor(

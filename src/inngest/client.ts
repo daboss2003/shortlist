@@ -15,7 +15,10 @@ export const inngest = new Inngest({
 
 export const CV_PROCESS_REQUESTED = "cv/process.requested";
 
-/** Process one candidate's CV. companyId is the fairness (concurrency) key. */
+/**
+ * Process one candidate's CV. companyId is the fairness (concurrency) key. Inngest stores event data, so it holds
+ * ids only: never the CV, the candidate's name or contact details.
+ */
 export const cvProcessRequested = eventType(CV_PROCESS_REQUESTED, {
   schema: z.object({ candidateId: z.string(), companyId: z.string() }),
 });
@@ -24,19 +27,18 @@ export const cvProcessRequested = eventType(CV_PROCESS_REQUESTED, {
 const SEND_BATCH = 200;
 
 /**
- * Sends one `cv/process.requested` per candidate. With `dedupeKey`, each event gets the id `<dedupeKey>-<id>`, and
- * Inngest drops a repeat of that id within 24 hours.
+ * Sends one `cv/process.requested` per row, with the row's event id: Inngest drops an event whose id it has seen in
+ * the last 24 hours (see processEventId in src/lib/pipeline/index.ts).
  */
 export async function sendCvProcessRequested(
-  rows: Array<{ id: string; companyId: string }>,
-  { dedupeKey }: { dedupeKey?: string } = {},
+  rows: Array<{ id: string; companyId: string; eventId: string }>,
 ): Promise<void> {
   for (let i = 0; i < rows.length; i += SEND_BATCH) {
     await inngest.send(
       rows.slice(i, i + SEND_BATCH).map((row) => ({
+        id: row.eventId,
         name: CV_PROCESS_REQUESTED,
         data: { candidateId: row.id, companyId: row.companyId },
-        ...(dedupeKey ? { id: `${dedupeKey}-${row.id}` } : {}),
       })),
     );
   }

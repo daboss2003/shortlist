@@ -27,6 +27,37 @@ describe("/api/inngest", () => {
     expect(res.status).toBe(401);
   });
 
+  it("refuses an unsigned sync (PUT) without registering anything with Inngest", async () => {
+    vi.stubEnv("INNGEST_SIGNING_KEY", `signkey-prod-${"ab".repeat(32)}`);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The SDK registers by POSTing to Inngest's API with fetch: a registration would show up here.
+    const fetchSpy = vi.fn(async () => Response.json({ ok: true, modified: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    try {
+      const res = await PUT(new NextRequest("https://evil.example.com/api/inngest", { method: "PUT" }), {});
+
+      expect(res.status).toBe(401);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("asks once for APP_URL on a deployed site without it", async () => {
+    vi.stubEnv("NETLIFY", "true");
+    vi.stubEnv("APP_URL", "");
+    vi.stubEnv("INNGEST_SIGNING_KEY", `signkey-prod-${"ab".repeat(32)}`);
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await GET(new NextRequest(URL), {});
+    await GET(new NextRequest(URL), {});
+
+    expect(errorLog.mock.calls.filter(([msg]) => String(msg).includes("APP_URL"))).toHaveLength(1);
+  });
+
   it.each([
     ["GET", GET],
     ["POST", POST],

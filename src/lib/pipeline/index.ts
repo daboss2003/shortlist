@@ -1,12 +1,12 @@
 import "server-only";
-import { and, asc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { after } from "next/server";
 import { db } from "@/db";
 import { aiUsage, candidates, jobs } from "@/db/schema";
 import { sendCvProcessRequested } from "@/inngest/client";
 import { AiAnalysisError, AiNotConfiguredError, analyzeCv } from "@/lib/ai/analyze";
 import { resolveProviderChain } from "@/lib/ai/providers";
-import { dailyLimit, tryReserveAnalysis, utcDay } from "@/lib/ai/quota";
+import { dailyLimit, getAiQuota, utcDay } from "@/lib/ai/quota";
 import { describeError } from "@/lib/log";
 import { TaskQueue } from "@/lib/pipeline/queue";
 import { executionMode } from "@/lib/pipeline/runtime";
@@ -15,10 +15,11 @@ import {
   GAVE_UP_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
   MAX_ATTEMPTS,
+  claimGeneration,
   claimPending,
   markFailed,
   readCvText,
-  releaseForQuota,
+  reserveQuotaStep,
   saveAnalysis,
   saveCvText,
 } from "@/lib/pipeline/steps";
@@ -32,6 +33,12 @@ const REQUEUE_INTERVAL_MS = 5 * 60 * 1000;
 const REQUEUE_BATCH = 1000;
 /** Inngest mode: pending CVs younger than this are left alone; their own event is most likely still on its way. */
 const REQUEUE_MIN_AGE_MS = 5 * 60 * 1000;
+/**
+ * Inngest mode: a CV still "processing" this long after its claim is re-sent. Far beyond a healthy run (a few
+ * steps of under 60 s each, plus retries), so its run is taken to be lost: an outage, or a run that ended without
+ * its onFailure handler failing the CV.
+ */
+const STALE_CLAIM_MS = 30 * 60 * 1000;
 const REQUEUE_CRON_BATCH = 200;
 const LOOKUP_CHUNK = 500;
 
@@ -49,6 +56,24 @@ queue.worker = processCandidate;
 const inFlight = (globalForQueue.__cvPipelineInFlight ??= new Set());
 
 type QueuedCandidate = { id: string; companyId: string };
+/** One `cv/process.requested` event to send. */
+export type ProcessRequest = QueuedCandidate & { eventId: string };
+
+/**
+ * Intentional: process-cv event ids are deterministic, because Inngest drops an event whose id it has seen in the
+ * last 24 hours. A re-queue of a CV whose event is still waiting (behind its company's concurrency limit) is then
+ * dropped, instead of cancelling and replacing its queued run. The id names the CV's claim generation: the token
+ * of its last claim, or "new" before the first one. Every claim stores a fresh token, and a re-score (or a quota
+ * release) leaves the row pending with the token of the claim that has run since the previous send, so its id is
+ * always new and the CV runs again. A second re-score before the CV is claimed again shares the queued run's id;
+ * that run reads the current job when it analyzes, so nothing is lost. `attempts` would be wrong: a re-score resets
+ * it to 0, the value of the very first send, and Inngest would drop the re-score. Relies on markForRescore (and
+ * anything else that sets a row back to "pending") leaving claim_token as it is.
+ * A CV stuck "processing" is re-sent under its own id (`-stale`), once per stuck claim.
+ */
+export function processEventId(candidateId: string, claimToken: string | null, { stale = false } = {}): string {
+  return `cv-${candidateId}-${claimGeneration(claimToken) ?? "new"}${stale ? "-stale" : ""}`;
+}
 
 /**
  * Queues candidates for text extraction + AI analysis without blocking the response. Never throws: the rows are
@@ -59,9 +84,9 @@ export async function scheduleCandidateProcessing(candidateIds: string[]): Promi
   const ids = [...new Set(candidateIds)];
   if (ids.length === 0) return;
 
-  let rows: QueuedCandidate[];
+  let rows: Array<QueuedCandidate & { claimToken: string | null }>;
   try {
-    rows = await lookupCompanies(ids);
+    rows = await lookupCandidates(ids);
   } catch (err) {
     // Intentional: not rethrown — see above.
     console.error("[pipeline] could not schedule candidates:", describeError(err, { withStack: true }));
@@ -71,8 +96,16 @@ export async function scheduleCandidateProcessing(candidateIds: string[]): Promi
 
   const mode = executionMode();
   if (mode === "inngest") {
+    // Intentional: nothing is sent while no AI provider is configured. The run would end without claiming the CV,
+    // and its event id would stop the re-queue cron's send for 24 hours once a provider is added.
+    if (resolveProviderChain().chain.length === 0) return;
     try {
-      await sendCvProcessRequested(rows);
+      const requests = rows.map(({ id, companyId, claimToken }) => ({
+        id,
+        companyId,
+        eventId: processEventId(id, claimToken),
+      }));
+      await sendCvProcessRequested(await withinTodaysQuota(requests));
     } catch (err) {
       // Intentional: not rethrown — the re-queue cron sends events for CVs still pending after a few minutes.
       console.error("[pipeline] could not send CVs to Inngest:", describeError(err));
@@ -92,18 +125,36 @@ export async function scheduleCandidateProcessing(candidateIds: string[]): Promi
 }
 
 /** The caller's order (so each company's CVs are processed in arrival order); deleted ids are skipped. */
-async function lookupCompanies(ids: string[]): Promise<QueuedCandidate[]> {
-  const companyOf = new Map<string, string>();
+async function lookupCandidates(ids: string[]): Promise<Array<QueuedCandidate & { claimToken: string | null }>> {
+  const found = new Map<string, { companyId: string; claimToken: string | null }>();
   for (let i = 0; i < ids.length; i += LOOKUP_CHUNK) {
     const rows = await db
-      .select({ id: candidates.id, companyId: candidates.companyId })
+      .select({ id: candidates.id, companyId: candidates.companyId, claimToken: candidates.claimToken })
       .from(candidates)
       .where(inArray(candidates.id, ids.slice(i, i + LOOKUP_CHUNK)));
-    for (const row of rows) companyOf.set(row.id, row.companyId);
+    for (const row of rows) found.set(row.id, row);
   }
   return ids.flatMap((id) => {
-    const companyId = companyOf.get(id);
-    return companyId ? [{ id, companyId }] : [];
+    const row = found.get(id);
+    return row ? [{ id, companyId: row.companyId, claimToken: row.claimToken }] : [];
+  });
+}
+
+/**
+ * No more per company than its remaining AI allowance today (all of them when the cap is off), in the caller's
+ * order. The rest stay pending for the re-queue cron, which sends them once the cap resets: a run sent now would
+ * only claim the CV and hand it straight back, spending executions of the free plan for nothing.
+ */
+async function withinTodaysQuota<T extends QueuedCandidate>(rows: T[]): Promise<T[]> {
+  const left = new Map<string, number | null>();
+  for (const companyId of new Set(rows.map((row) => row.companyId))) {
+    left.set(companyId, (await getAiQuota(companyId)).remaining);
+  }
+  return rows.filter((row) => {
+    const remaining = left.get(row.companyId);
+    if (remaining == null) return true;
+    left.set(row.companyId, remaining - 1);
+    return remaining > 0;
   });
 }
 
@@ -131,7 +182,8 @@ export async function processCandidate(candidateId: string): Promise<void> {
     // added and the server restarts; boot recovery and the periodic re-queue then pick it up.
     if (chain.length === 0) return;
 
-    const candidate = await claimPending(candidateId);
+    const token = crypto.randomUUID();
+    const candidate = await claimPending(candidateId, token);
     if (!candidate) return;
 
     try {
@@ -141,20 +193,17 @@ export async function processCandidate(candidateId: string): Promise<void> {
       let cvText = candidate.cvText;
       if (cvText == null) {
         cvText = await readCvText(candidate.cvFileKey);
-        if (!(await saveCvText(candidate.id, cvText))) return;
+        if (!(await saveCvText(candidate.id, token, cvText))) return;
       }
 
       // Charged only now, right before the AI call: an unreadable CV never uses up the company's daily cap.
-      if (!(await tryReserveAnalysis(candidate.companyId))) {
-        await releaseForQuota(candidate.id);
-        return;
-      }
+      if ((await reserveQuotaStep(candidate.id, token)) !== "reserved") return;
 
-      await saveAnalysis(candidate.id, await analyzeCv({ cvText, job }, chain));
+      await saveAnalysis(candidate.id, token, await analyzeCv({ cvText, job }, chain));
     } catch (err) {
       const known = err instanceof AiNotConfiguredError || err instanceof AiAnalysisError || err instanceof CvUnreadableError;
       console.error(`[pipeline] candidate ${candidate.id} failed:`, describeError(err, { withStack: !known }));
-      await markFailed(candidate.id, known ? (err as Error).message : GENERIC_FAILURE_MESSAGE);
+      await markFailed(candidate.id, token, known ? (err as Error).message : GENERIC_FAILURE_MESSAGE);
     }
   } catch (err) {
     console.error(`[pipeline] could not process candidate ${candidateId}:`, describeError(err, { withStack: true }));
@@ -210,30 +259,32 @@ async function pendingCandidates(limit?: number): Promise<QueuedCandidate[]> {
 
 /**
  * Inngest mode (the `requeue-pending` cron): sends events for CVs still pending after a few minutes — a lost event,
- * a cap that reset at midnight UTC, a provider added since. Returns how many were sent. Sends only what can run now,
- * so free-plan executions aren't spent on claims that would bounce straight back to pending.
+ * a cap that reset at midnight UTC, a provider added since — and for CVs stuck "processing" since a claim that never
+ * finished (an outage, a run that died). Returns how many were sent. Sends only what can run now, so free-plan
+ * executions aren't spent on claims that would bounce straight back to pending. Each CV is sent under its
+ * deterministic event id (see processEventId), so one whose event is already queued isn't sent again.
  */
 export async function requeuePendingCandidates(now: Date = new Date()): Promise<number> {
   if (resolveProviderChain().chain.length === 0) return 0;
   const rows = await findRequeueCandidates(now);
   if (rows.length === 0) return 0;
-  // Intentional: at most one re-queue per candidate per UTC day (Inngest drops repeated event ids for 24 h). A
-  // pending CV may simply be waiting behind its company's concurrency limit; re-sending it every 30 minutes would
-  // replace its queued run each time. A run that hits the cap after its re-queue can't run again until tomorrow.
-  await sendCvProcessRequested(rows, { dedupeKey: `requeue-${utcDay(now)}` });
+  await sendCvProcessRequested(rows);
   return rows.length;
 }
 
 /**
- * Pending CVs older than REQUEUE_MIN_AGE_MS, oldest first, at most REQUEUE_CRON_BATCH, and per company no more
- * than its remaining AI allowance today (all of them when the cap is off).
+ * Pending CVs older than REQUEUE_MIN_AGE_MS, and CVs claimed more than STALE_CLAIM_MS ago and still processing
+ * (or, from before claims were timed, with no claim time), oldest first, at most REQUEUE_CRON_BATCH, and per company
+ * no more than its remaining AI allowance today (all of them when the cap is off).
  */
-export async function findRequeueCandidates(now: Date = new Date()): Promise<QueuedCandidate[]> {
+export async function findRequeueCandidates(now: Date = new Date()): Promise<ProcessRequest[]> {
   const limit = dailyLimit();
   const ranked = db
     .select({
       id: candidates.id,
       companyId: candidates.companyId,
+      claimToken: candidates.claimToken,
+      stale: sql<boolean>`${candidates.status} = 'processing'`.as("stale"),
       createdAt: candidates.createdAt,
       rank: sql<number>`row_number() over (partition by ${candidates.companyId} order by ${candidates.createdAt}, ${candidates.id})`.as(
         "rank",
@@ -243,18 +294,26 @@ export async function findRequeueCandidates(now: Date = new Date()): Promise<Que
     .from(candidates)
     .leftJoin(aiUsage, and(eq(aiUsage.companyId, candidates.companyId), eq(aiUsage.day, utcDay(now))))
     .where(
-      and(
-        eq(candidates.status, "pending"),
-        lte(candidates.createdAt, new Date(now.getTime() - REQUEUE_MIN_AGE_MS)),
+      or(
+        and(eq(candidates.status, "pending"), lte(candidates.createdAt, new Date(now.getTime() - REQUEUE_MIN_AGE_MS))),
+        and(
+          eq(candidates.status, "processing"),
+          or(isNull(candidates.claimedAt), lte(candidates.claimedAt, new Date(now.getTime() - STALE_CLAIM_MS))),
+        ),
       ),
     )
     .as("ranked");
-  return db
-    .select({ id: ranked.id, companyId: ranked.companyId })
+  const rows = await db
+    .select({ id: ranked.id, companyId: ranked.companyId, claimToken: ranked.claimToken, stale: ranked.stale })
     .from(ranked)
     .where(limit == null ? undefined : sql`${ranked.rank} <= ${limit} - ${ranked.used}`)
     .orderBy(asc(ranked.createdAt), asc(ranked.id))
     .limit(REQUEUE_CRON_BATCH);
+  return rows.map((row) => ({
+    id: row.id,
+    companyId: row.companyId,
+    eventId: processEventId(row.id, row.claimToken, { stale: row.stale }),
+  }));
 }
 
 /** Test-only: resolves once nothing is being looked up, waiting or running in the in-process queue. */

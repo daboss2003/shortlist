@@ -5,7 +5,13 @@ import zlib from "node:zlib";
 import JSZip from "jszip";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { normalizeText, wordXmlText } from "./extract-core.mjs";
-import { extractCvText as extractCvTextIn, extractionMode, runCvExtractor, runInlineExtractor, type ExtractionMode } from "./extract-text";
+import {
+  extractCvText as extractCvTextIn,
+  extractionMode,
+  runCvExtractor,
+  runInlineExtractor,
+  type ExtractionMode,
+} from "./extract-text";
 
 async function buildDocx(paragraphs: string[]): Promise<Buffer> {
   const zip = new JSZip();
@@ -230,7 +236,8 @@ describe.each(["isolated", "inline"] as const)("extractCvText (%s)", (mode: Extr
     30_000,
   );
 
-  // Inline mode has no memory cap of its own: on serverless an out-of-memory parse only ends that one invocation.
+  // Inline mode caps the worker's JS heap, not its off-heap buffers (where this bomb lives): on serverless an
+  // out-of-memory parse only ends that one invocation.
   it.runIf(mode === "isolated")(
     "kills the parser once its memory passes the cap, even when the zip lies about its sizes",
     async () => {
@@ -347,31 +354,41 @@ describe("runCvExtractor", () => {
 });
 
 describe("runInlineExtractor", () => {
-  it("gives up on a parser that runs past the soft timeout", async () => {
-    const started = performance.now();
+  it("gives up on a parse that runs past the timeout", async () => {
+    const t0 = performance.now();
     const never = () => new Promise<string>(() => {});
-    await expect(runInlineExtractor(Buffer.from("x"), "pdf", { timeoutMs: 50, extract: never })).rejects.toThrow(
-      "CV text extraction timed out after 0.05s",
+    await expect(runInlineExtractor(Buffer.from("x"), "pdf", { timeoutMs: 300, extract: never })).rejects.toThrow(
+      "CV text extraction timed out after 0.3s",
     );
-    expect(performance.now() - started).toBeLessThan(1000);
+    expect(performance.now() - t0).toBeLessThan(3000);
   });
 
   it("rejects more than 1 MB of output", async () => {
     const flood = async () => "é".repeat(600 * 1024);
     await expect(runInlineExtractor(Buffer.from("x"), "txt", { timeoutMs: 10_000, extract: flood })).rejects.toThrow(
-      /too much output/,
+      "CV text extraction produced too much output",
     );
   });
 
   it("reports the parser's reason on one short line", async () => {
     const fail = async () => {
-      throw new Error(`bad\nfile ${"x".repeat(1000)}`);
+      throw new Error("bad\nfile " + "x".repeat(1000));
     };
     const err = (await runInlineExtractor(Buffer.from("x"), "pdf", { timeoutMs: 10_000, extract: fail }).catch(
       (e: unknown) => e,
     )) as Error;
     expect(err.message).toMatch(/^CV text extraction failed: bad file x+$/);
     expect(err.message.length).toBeLessThan(350);
+  });
+
+  it("hands the parser the CV's bytes and type, and uses the shared extractor by default", async () => {
+    const echo = async (bytes: Buffer, type: string) => `${type}:${bytes.toString("utf8")}`;
+    await expect(runInlineExtractor(Buffer.from("héllo"), "docx", { timeoutMs: 10_000, extract: echo })).resolves.toBe(
+      "docx:héllo",
+    );
+    await expect(runInlineExtractor(Buffer.from("Plain CV text"), "txt", { timeoutMs: 10_000 })).resolves.toBe(
+      "Plain CV text",
+    );
   });
 });
 

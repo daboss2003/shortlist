@@ -4,7 +4,7 @@ import { db } from "@/db";
 import { aiUsage } from "@/db/schema";
 
 // CONTRACT (frozen) — implemented by the pipeline workstream. Per-company daily cap on AI analyses
-// (each pipeline run that calls the AI counts once, re-scores included). AI_DAILY_LIMIT: default 500;
+// (each claim of a CV that reaches the AI counts once, re-scores included). AI_DAILY_LIMIT: default 500;
 // 0 (or negative) = unlimited. Days are UTC. Backed by the `ai_usage` table.
 
 export type AiQuota = {
@@ -42,20 +42,30 @@ export async function getAiQuota(companyId: string, now: Date = new Date()): Pro
   return { used, limit, remaining: limit == null ? null : Math.max(0, limit - used), resetsAt: nextUtcMidnight(now) };
 }
 
-/** Atomically counts one analysis against today's cap. Returns false (and counts nothing) when the cap is reached. */
+/**
+ * The conflict clause of every charge (an INSERT of `analyses: 1` into ai_usage): one more analysis, only while
+ * under today's cap. In one statement, concurrent charges can't both take the last slot: the conflicting row is
+ * locked and the WHERE re-checked against its latest value. A row is returned only when one was inserted or
+ * incremented. Unlimited still counts usage.
+ */
+export function chargeOnConflict(limit: number | null = dailyLimit()) {
+  return {
+    target: [aiUsage.companyId, aiUsage.day],
+    set: { analyses: sql`${aiUsage.analyses} + 1` },
+    setWhere: limit == null ? undefined : sql`${aiUsage.analyses} < ${limit}`,
+  };
+}
+
+/**
+ * Atomically counts one analysis against today's cap. Returns false (and counts nothing) when the cap is reached.
+ * The pipeline charges through `reserveQuota` (src/lib/pipeline/steps.ts) instead, which also ties the charge to
+ * the CV's claim.
+ */
 export async function tryReserveAnalysis(companyId: string, now: Date = new Date()): Promise<boolean> {
-  const limit = dailyLimit();
-  // One statement, so concurrent reservations can't both take the last slot: the conflicting row is locked and the
-  // WHERE re-checked against its latest value. A row comes back only when one was inserted or incremented.
-  // Unlimited still counts usage.
   const rows = await db
     .insert(aiUsage)
     .values({ companyId, day: utcDay(now), analyses: 1 })
-    .onConflictDoUpdate({
-      target: [aiUsage.companyId, aiUsage.day],
-      set: { analyses: sql`${aiUsage.analyses} + 1` },
-      setWhere: limit == null ? undefined : sql`${aiUsage.analyses} < ${limit}`,
-    })
+    .onConflictDoUpdate(chargeOnConflict())
     .returning({ analyses: aiUsage.analyses });
   return rows.length > 0;
 }

@@ -1,25 +1,27 @@
 import "server-only";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { candidates, jobs, type Candidate } from "@/db/schema";
+import { aiUsage, candidates, jobs, type Candidate } from "@/db/schema";
 import { AiAnalysisError, analyzeCvWithProvider, type AnalyzeResult } from "@/lib/ai/analyze";
 import { resolveProviderChain, type ResolvedProvider } from "@/lib/ai/providers";
-import { tryReserveAnalysis } from "@/lib/ai/quota";
+import { chargeOnConflict, utcDay } from "@/lib/ai/quota";
 import { extractCvText } from "@/lib/cv/extract-text";
 import { CV_FILE_TYPES, type CvFileType } from "@/lib/cv/file-type";
 import { describeError } from "@/lib/log";
 import { readCvFile } from "@/lib/storage";
 
-// The pipeline's units of work for one candidate: claim → extract text → reserve quota → analyze → save.
+// The pipeline's units of work for one candidate: claim → extract text → reserve quota → analyze and save.
 // processCandidate (in-process mode) calls the shared helpers directly; the Inngest function runs
 // runProcessCvSteps, where each unit is a durable step that must finish well inside Netlify's 60 s.
-// Every write after a claim is conditional on the row still being "processing" (see `stillClaimed`).
+// A claim stores a token (the Inngest run id, or a random UUID in-process). Every later write is conditional on the
+// row still being "processing" under that token (see `ownedBy`), so a superseded or failed older run can't
+// overwrite a newer one: a re-score resets the row to "pending", and a newer run's claim replaces the token.
 
 const MIN_CV_TEXT_CHARS = 100;
 const MAX_STORED_CV_CHARS = 100_000;
 /** Claims (since the last re-score) after which a CV that was interrupted each time is failed instead of retried. */
 export const MAX_ATTEMPTS = 3;
-/** One provider's budget inside one step: under Netlify's 60 s, with room for the DB reads around the call. */
+/** One provider's budget inside one step: under Netlify's 60 s, with room for the DB reads and the save around it. */
 export const PROVIDER_STEP_TIMEOUT_MS = 45_000;
 
 export const UNREADABLE_CV_MESSAGE =
@@ -31,18 +33,42 @@ export const GAVE_UP_MESSAGE = "We couldn't process this CV. Try re-scoring it, 
 export class CvUnreadableError extends Error {}
 
 /**
- * Writes after the claim land only while the row is still ours. A re-score meanwhile resets it to "pending" and
- * the CV is processed again (against the current job), so a superseded run's results are discarded.
+ * Intentional: claim_token also records whether the claim has been charged against the daily AI cap. reserveQuota
+ * rewrites `<token>` to `<token>:charged` in the same statement as the charge, so a retried reservation (its first
+ * response lost) sees the charge instead of counting it twice. Both forms are the same claim; no schema change needed.
  */
-const stillClaimed = (candidateId: string) => and(eq(candidates.id, candidateId), eq(candidates.status, "processing"));
+const CHARGED_SUFFIX = ":charged";
+const chargedForm = (token: string) => `${token}${CHARGED_SUFFIX}`;
+
+/** The row is still "processing" under the claim `token` (charged or not). */
+const ownedBy = (candidateId: string, token: string) =>
+  and(
+    eq(candidates.id, candidateId),
+    eq(candidates.status, "processing"),
+    inArray(candidates.claimToken, [token, chargedForm(token)]),
+  );
+
+/** The claim a stored claim_token names, without the charge marker. null before the CV's first claim. */
+export function claimGeneration(claimToken: string | null): string | null {
+  return claimToken?.endsWith(CHARGED_SUFFIX) ? claimToken.slice(0, -CHARGED_SUFFIX.length) : claimToken;
+}
+
+/** What every claim writes. */
+const claimedBy = (token: string) => ({
+  status: "processing" as const,
+  error: null,
+  attempts: sql`${candidates.attempts} + 1`,
+  claimToken: token,
+  claimedAt: new Date(),
+});
 
 // ── Shared by both modes ──
 
-/** Atomic claim: only one caller can move a row out of "pending". */
-export async function claimPending(candidateId: string): Promise<Candidate | undefined> {
+/** Atomic claim: only one caller can move a row out of "pending". `token` then owns every later write. */
+export async function claimPending(candidateId: string, token: string): Promise<Candidate | undefined> {
   const [candidate] = await db
     .update(candidates)
-    .set({ status: "processing", error: null, attempts: sql`${candidates.attempts} + 1` })
+    .set(claimedBy(token))
     .where(and(eq(candidates.id, candidateId), eq(candidates.status, "pending")))
     .returning();
   return candidate;
@@ -64,24 +90,71 @@ export async function readCvText(fileKey: string): Promise<string> {
 }
 
 /** False when the claim was lost. */
-export async function saveCvText(candidateId: string, cvText: string): Promise<boolean> {
-  const rows = await db.update(candidates).set({ cvText }).where(stillClaimed(candidateId)).returning({ id: candidates.id });
+export async function saveCvText(candidateId: string, token: string, cvText: string): Promise<boolean> {
+  const rows = await db
+    .update(candidates)
+    .set({ cvText })
+    .where(ownedBy(candidateId, token))
+    .returning({ id: candidates.id });
   return rows.length > 0;
+}
+
+export type ReserveResult = "reserved" | "quota-reached" | "superseded";
+
+/**
+ * Counts this claim's analysis against the company's daily cap, in one statement: only while the row is still
+ * claimed by `token` (a superseded or deleted CV costs nothing), and only once per claim (a retry finds the charge
+ * marker and reports "reserved" again without counting). The candidate row is locked first, so a re-score or delete
+ * can't land between the check and the charge.
+ */
+export async function reserveQuota(candidateId: string, token: string, now: Date = new Date()): Promise<ReserveResult> {
+  const charged = chargedForm(token);
+  const owned = db.$with("owned").as(
+    db
+      .select({ companyId: candidates.companyId, claimToken: candidates.claimToken })
+      .from(candidates)
+      .where(ownedBy(candidateId, token))
+      .for("update"),
+  );
+  const charge = db.$with("charge").as(
+    db
+      .insert(aiUsage)
+      .select(sql`select ${owned.companyId}, ${utcDay(now)}, 1 from ${owned} where ${owned.claimToken} = ${token}`)
+      .onConflictDoUpdate(chargeOnConflict())
+      .returning({ companyId: aiUsage.companyId }),
+  );
+  const mark = db.$with("mark").as(
+    db
+      .update(candidates)
+      .set({ claimToken: charged })
+      .where(and(eq(candidates.id, candidateId), eq(candidates.claimToken, token), sql`exists (select 1 from ${charge})`))
+      .returning({ id: candidates.id }),
+  );
+  const [row] = await db
+    .with(owned, charge, mark)
+    .select({ claimToken: owned.claimToken, chargedNow: sql<boolean>`exists (select 1 from ${mark})` })
+    .from(owned);
+  if (!row) return "superseded";
+  return row.claimToken === charged || row.chargedNow ? "reserved" : "quota-reached";
 }
 
 /**
  * Daily AI cap reached: back to pending (the extracted text is kept), and this claim doesn't count as an attempt.
  * The re-queue retries it once the UTC day rolls over.
  */
-export async function releaseForQuota(candidateId: string): Promise<void> {
+export async function releaseForQuota(candidateId: string, token: string): Promise<void> {
   await db
     .update(candidates)
     .set({ status: "pending", attempts: sql`${candidates.attempts} - 1` })
-    .where(stillClaimed(candidateId));
+    .where(ownedBy(candidateId, token));
 }
 
 /** Stores the analysis and marks the candidate ready. False when the claim was lost (nothing written). */
-export async function saveAnalysis(candidateId: string, { analysis, provider, modelId }: AnalyzeResult): Promise<boolean> {
+export async function saveAnalysis(
+  candidateId: string,
+  token: string,
+  { analysis, provider, modelId }: AnalyzeResult,
+): Promise<boolean> {
   const { profile, evaluation } = analysis;
   const rows = await db
     .update(candidates)
@@ -99,57 +172,55 @@ export async function saveAnalysis(candidateId: string, { analysis, provider, mo
       email: sql`coalesce(${candidates.email}, ${profile.email?.toLowerCase() ?? null})`,
       phone: sql`coalesce(${candidates.phone}, ${profile.phone})`,
     })
-    .where(stillClaimed(candidateId))
+    .where(ownedBy(candidateId, token))
     .returning({ id: candidates.id });
   return rows.length > 0;
 }
 
 /** `message` must be employer-safe. False when the claim was lost (nothing written). */
-export async function markFailed(candidateId: string, message: string): Promise<boolean> {
+export async function markFailed(candidateId: string, token: string, message: string): Promise<boolean> {
   const rows = await db
     .update(candidates)
     .set({ status: "failed", error: message })
-    .where(stillClaimed(candidateId))
+    .where(ownedBy(candidateId, token))
     .returning({ id: candidates.id });
   return rows.length > 0;
 }
 
-// ── Durable (Inngest) steps. Each returns plain JSON: it is stored as the step's result. ──
+// ── Durable (Inngest) steps. Each returns plain JSON: Inngest stores it as the step's result, beyond the reach of
+// retention deletes, so a step must never return (or throw) the CV's text, profile, evaluation or contact details. ──
 
-export type ClaimStepResult = { claimed: true; companyId: string; needsText: boolean } | { claimed: false; gaveUp: boolean };
+export type ClaimStepResult = { claimed: true; needsText: boolean } | { claimed: false; gaveUp: boolean };
 
 /**
- * Claims the row for this run. A row already "processing" is taken over too: runs are singletons per candidate
- * (a newer run cancels the older one), so it belongs to a cancelled run, or to this run's own claim whose result
- * was lost and is being retried. Each claim counts an attempt; past MAX_ATTEMPTS the CV is failed, so a file that
- * kills the function every time can't loop forever.
+ * Claims the row for the run holding `token`. A row already "processing" is taken over too: runs are singletons per
+ * candidate (a newer run cancels the older one), so it belongs to a cancelled run, to a run stuck since an outage
+ * (re-sent by the re-queue cron), or to this run's own claim whose result was lost and is being retried. The new
+ * token shuts out any write the old run still makes. Each claim counts an attempt; past MAX_ATTEMPTS the CV is
+ * failed, so a file that kills the function every time can't loop forever.
  */
-export async function claimStep(candidateId: string): Promise<ClaimStepResult> {
+export async function claimStep(candidateId: string, token: string): Promise<ClaimStepResult> {
   const [row] = await db
     .update(candidates)
-    .set({ status: "processing", error: null, attempts: sql`${candidates.attempts} + 1` })
+    .set(claimedBy(token))
     .where(and(eq(candidates.id, candidateId), inArray(candidates.status, ["pending", "processing"])))
-    .returning({
-      companyId: candidates.companyId,
-      attempts: candidates.attempts,
-      hasText: sql<boolean>`${candidates.cvText} is not null`,
-    });
+    .returning({ attempts: candidates.attempts, hasText: sql<boolean>`${candidates.cvText} is not null` });
   if (!row) return { claimed: false, gaveUp: false };
   if (row.attempts > MAX_ATTEMPTS) {
-    await markFailed(candidateId, GAVE_UP_MESSAGE);
+    await markFailed(candidateId, token, GAVE_UP_MESSAGE);
     return { claimed: false, gaveUp: true };
   }
-  return { claimed: true, companyId: row.companyId, needsText: !row.hasText };
+  return { claimed: true, needsText: !row.hasText };
 }
 
 export type ExtractStepResult = "ok" | "unreadable" | "superseded";
 
 /** Extracts and stores the CV text (inline on serverless). Storage and DB errors throw, so the step is retried. */
-export async function extractStep(candidateId: string): Promise<ExtractStepResult> {
+export async function extractStep(candidateId: string, token: string): Promise<ExtractStepResult> {
   const [row] = await db
     .select({ cvFileKey: candidates.cvFileKey, hasText: sql<boolean>`${candidates.cvText} is not null` })
     .from(candidates)
-    .where(stillClaimed(candidateId))
+    .where(ownedBy(candidateId, token))
     .limit(1);
   if (!row) return "superseded";
   if (row.hasText) return "ok";
@@ -160,31 +231,33 @@ export async function extractStep(candidateId: string): Promise<ExtractStepResul
   } catch (err) {
     if (!(err instanceof CvUnreadableError)) throw err;
     // Not retried: the same file gives the same result.
-    return (await markFailed(candidateId, err.message)) ? "unreadable" : "superseded";
+    return (await markFailed(candidateId, token, err.message)) ? "unreadable" : "superseded";
   }
-  return (await saveCvText(candidateId, cvText)) ? "ok" : "superseded";
+  return (await saveCvText(candidateId, token, cvText)) ? "ok" : "superseded";
 }
-
-export type ReserveStepResult = "reserved" | "quota-reached";
 
 /** Charged only now, after extraction: an unreadable CV never uses up the company's daily cap. */
-export async function reserveQuotaStep(candidateId: string, companyId: string): Promise<ReserveStepResult> {
-  if (await tryReserveAnalysis(companyId)) return "reserved";
-  await releaseForQuota(candidateId);
-  return "quota-reached";
+export async function reserveQuotaStep(candidateId: string, token: string): Promise<ReserveResult> {
+  const reserved = await reserveQuota(candidateId, token);
+  if (reserved === "quota-reached") await releaseForQuota(candidateId, token);
+  return reserved;
 }
 
-export type AnalyzeStepResult =
-  | { status: "ok"; result: AnalyzeResult }
-  | { status: "failed"; reason: string }
-  | { status: "superseded" };
+/**
+ * Why one provider's step didn't save an analysis: a short code, never the provider's message (which can quote the
+ * prompt, and so the CV). "superseded": the claim was lost, so the run stops.
+ */
+export type AnalyzeFailure = "superseded" | "timeout" | "invalid-output" | `http-${number}` | "provider-error";
+export type AnalyzeStepResult = { ok: true } | { ok: false; reason: AnalyzeFailure };
 
 /**
- * One provider of the fallback chain. A provider failure is returned, not thrown, so the run moves on to the next
- * provider instead of Inngest retrying this one.
+ * One provider of the fallback chain: calls the AI and saves its analysis in the same step, so the analysis never
+ * becomes a step result. A provider failure is returned, not thrown, so the run moves on to the next provider
+ * instead of Inngest retrying this one.
  */
 export async function analyzeStep(
   candidateId: string,
+  token: string,
   provider: ResolvedProvider,
   { timeoutMs = PROVIDER_STEP_TIMEOUT_MS }: { timeoutMs?: number } = {},
 ): Promise<AnalyzeStepResult> {
@@ -192,14 +265,23 @@ export async function analyzeStep(
     .select({ cvText: candidates.cvText, job: jobs })
     .from(candidates)
     .innerJoin(jobs, eq(jobs.id, candidates.jobId))
-    .where(stillClaimed(candidateId))
+    .where(ownedBy(candidateId, token))
     .limit(1);
-  if (!row) return { status: "superseded" };
+  if (!row) return { ok: false, reason: "superseded" };
   // The claim step only skips extraction when the text exists, and nothing clears it.
   if (row.cvText == null) throw new Error(`Candidate ${candidateId} has no extracted text to analyze`);
 
   const attempt = await analyzeCvWithProvider({ cvText: row.cvText, job: row.job }, provider, { timeoutMs });
-  return attempt.ok ? { status: "ok", result: attempt.result } : { status: "failed", reason: attempt.reason };
+  if (!attempt.ok) return { ok: false, reason: failureCode(attempt.reason) };
+  return (await saveAnalysis(candidateId, token, attempt.result)) ? { ok: true } : { ok: false, reason: "superseded" };
+}
+
+/** Maps analyzeCvWithProvider's reason (already logged in full) to a code. Its formats are set in src/lib/ai/analyze.ts. */
+function failureCode(reason: string): AnalyzeFailure {
+  if (reason.startsWith("timed out")) return "timeout";
+  if (reason.startsWith("the response didn't match")) return "invalid-output";
+  const status = /^HTTP (\d{3})\b/.exec(reason)?.[1];
+  return status ? `http-${Number(status)}` : "provider-error";
 }
 
 /** What runs one durable step. Inngest's `step` in production; tests pass `{ run: (id, fn) => fn() }`. */
@@ -215,9 +297,13 @@ export type ProcessCvOutcome =
   | "ready"
   | "ai-failed";
 
-/** The Inngest process-cv run for one candidate: one step per unit of work, one step per provider. */
+/**
+ * The Inngest process-cv run for one candidate: one step per unit of work, one step per provider. `token` is the
+ * run's id: its claim token, which the run's onFailure handler also knows.
+ */
 export async function runProcessCvSteps(
   candidateId: string,
+  token: string,
   step: StepRunner,
   chain: ResolvedProvider[] = resolveProviderChain().chain,
 ): Promise<ProcessCvOutcome> {
@@ -225,27 +311,24 @@ export async function runProcessCvSteps(
   // the re-queue cron then picks it up.
   if (chain.length === 0) return "no-provider";
 
-  const claim = await step.run("claim", () => claimStep(candidateId));
+  const claim = await step.run("claim", () => claimStep(candidateId, token));
   if (!claim.claimed) return claim.gaveUp ? "gave-up" : "not-claimed";
 
   if (claim.needsText) {
-    const extracted = await step.run("extract", () => extractStep(candidateId));
+    const extracted = await step.run("extract", () => extractStep(candidateId, token));
     if (extracted !== "ok") return extracted;
   }
 
-  const quota = await step.run("reserve-quota", () => reserveQuotaStep(candidateId, claim.companyId));
+  const quota = await step.run("reserve-quota", () => reserveQuotaStep(candidateId, token));
   if (quota !== "reserved") return quota;
 
   for (const provider of chain) {
-    const attempt = await step.run(`analyze-${provider.id}`, () => analyzeStep(candidateId, provider));
-    if (attempt.status === "superseded") return "superseded";
-    if (attempt.status === "ok") {
-      const saved = await step.run("save", () => saveAnalysis(candidateId, attempt.result));
-      return saved ? "ready" : "superseded";
-    }
+    const attempt = await step.run(`analyze-${provider.id}`, () => analyzeStep(candidateId, token, provider));
+    if (attempt.ok) return "ready";
+    if (attempt.reason === "superseded") return "superseded";
   }
 
-  const failed = await step.run("mark-failed", () => markFailed(candidateId, new AiAnalysisError().message));
+  const failed = await step.run("mark-failed", () => markFailed(candidateId, token, new AiAnalysisError().message));
   return failed ? "ai-failed" : "superseded";
 }
 
