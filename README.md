@@ -1,4 +1,6 @@
-<img src="public/brand/icon-512.png" width="64" height="64" alt="Shortlist logo">
+<p align="center">
+  <img src="public/brand/icon-512.png" width="64" height="64" alt="Shortlist logo">
+</p>
 
 # Shortlist — CV collection & AI ranking
 
@@ -131,4 +133,4 @@ See `CLAUDE.md` for architecture and conventions, and `design-system.md` for UI 
 
 ## License
 
-[MIT](LICENSE) © 2026 Samson Oluwafemi
+[MIT](LICENSE) © 2026 daboss2003
