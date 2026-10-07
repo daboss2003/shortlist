@@ -41,4 +41,31 @@ describe("toCsv", () => {
       `'\t=1+1,plain,3.5`,
     ]);
   });
+
+  it("neutralizes formulas after a semicolon, which semicolon-separator Excel locales treat as a new cell", () => {
+    const csv = toCsv(columns, [
+      { Name: 'Jo;=HYPERLINK("x")', Note: "a; +cmd|' /C calc'!A0", Score: 1 },
+      { Name: "Node.js; @evil;-2+3", Note: "x;\t=1", Score: 2 },
+    ]);
+    expect(lines(csv).slice(1, 3)).toEqual([
+      `"Jo;'=HYPERLINK(""x"")",a; '+cmd|' /C calc'!A0,1`,
+      `Node.js; '@evil;'-2+3,x;\t'=1,2`,
+    ]);
+  });
+
+  it("leaves a phone number alone, and doesn't prefix one that follows a semicolon", () => {
+    const csv = toCsv(columns, [{ Name: "+234 803 555 0142", Note: "+44 20 7946 0000; +1 (555) 010-9999", Score: 1 }]);
+    expect(lines(csv)[1]).toBe(`+234 803 555 0142,'+44 20 7946 0000; +1 (555) 010-9999,1`);
+  });
+
+  it("handles a 100k-character digit string quickly", () => {
+    const rows: Row[] = [`-${"1".repeat(99_998)}x`, "1".repeat(100_000), `;-${"1".repeat(99_997)}x`].map((Name) => ({
+      Name,
+      Note: null,
+      Score: null,
+    }));
+    const start = performance.now();
+    toCsv(columns, rows);
+    expect(performance.now() - start).toBeLessThan(50);
+  });
 });

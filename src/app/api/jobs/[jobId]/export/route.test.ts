@@ -7,7 +7,7 @@ import { candidates, type Candidate, type CandidateStage } from "@/db/schema";
 import { getCurrentEmployer, type Employer } from "@/lib/auth/dal";
 import { createCandidateFromCv, validateCvUpload } from "@/lib/candidates/intake";
 import { makeCompany, makeJob } from "../../../../../../test/factories";
-import { GET } from "./route";
+import { GET, POST } from "./route";
 
 vi.mock("@/lib/auth/dal", () => ({ getCurrentEmployer: vi.fn() }));
 
@@ -30,6 +30,17 @@ function exportRequest(jobId: string, query: string) {
     params: Promise.resolve({ jobId }),
   });
 }
+
+function postExport(jobId: string, fields: Record<string, string>, origin = "http://localhost") {
+  const body = new FormData();
+  for (const [key, value] of Object.entries(fields)) body.append(key, value);
+  return POST(
+    new Request(`http://localhost/api/jobs/${jobId}/export`, { method: "POST", body, headers: { origin, host: "localhost" } }),
+    { params: Promise.resolve({ jobId }) },
+  );
+}
+
+const randomIds = (n: number) => Array.from({ length: n }, () => crypto.randomUUID());
 
 async function addCandidate(
   job: { id: string; companyId: string },
@@ -55,10 +66,15 @@ async function addCandidate(
     .get();
 }
 
+/** [Rank, Name] per CSV row (columns 1–2), header skipped. */
+async function csvRankedNames(res: Response) {
+  const lines = (await res.text()).replace(/^﻿/, "").trim().split("\r\n").slice(1);
+  return lines.map((line) => line.split(",").slice(0, 2));
+}
+
 /** Candidate names in CSV order (column 2), header skipped. */
 async function csvNames(res: Response) {
-  const lines = (await res.text()).replace(/^﻿/, "").trim().split("\r\n").slice(1);
-  return lines.map((line) => line.split(",")[1]);
+  return (await csvRankedNames(res)).map(([, name]) => name);
 }
 
 async function setup() {
@@ -107,7 +123,8 @@ describe("GET /api/jobs/[jobId]/export", () => {
       "format=csv&ids=not-a-uuid",
       `format=csv&ids=${high.id},1;drop table`,
       "format=csv&ids=",
-      `format=csv&ids=${Array.from({ length: 1001 }, () => crypto.randomUUID()).join(",")}`,
+      `format=csv&ids=${randomIds(301).join(",")}`,
+      `format=csv&ids=${randomIds(1001).join(",")}`,
     ]) {
       const res = await exportRequest(job.id, query);
       expect(res.status, query.slice(0, 60)).toBe(400);
@@ -140,6 +157,27 @@ describe("GET /api/jobs/[jobId]/export", () => {
     const onlyForeign = await exportRequest(job.id, `format=csv&ids=${foreign.id}`);
     expect(onlyForeign.status).toBe(400);
     expect(await onlyForeign.json()).toEqual({ error: "No candidates to export." });
+  });
+
+  it("caps a GET selection at 300 ids (larger selections are POSTed)", async () => {
+    const { job, high } = await setup();
+    const ok = await exportRequest(job.id, `format=csv&ids=${[...randomIds(299), high.id].join(",")}`);
+    expect(ok.status).toBe(200);
+    expect(await csvNames(ok)).toEqual(["High Score"]);
+
+    const tooMany = await exportRequest(job.id, `format=csv&ids=${[...randomIds(300), high.id].join(",")}`);
+    expect(tooMany.status).toBe(400);
+    expect(await tooMany.json()).toEqual({ error: "You can export at most 300 selected candidates." });
+  });
+
+  it("keeps the on-screen (whole-job) ranks when exporting a subset, and leaves unscored ranks empty", async () => {
+    const { job, low, mid, pending } = await setup();
+    const res = await exportRequest(job.id, `format=csv&ids=${pending.id},${low.id},${mid.id}`);
+    expect(await csvRankedNames(res)).toEqual([
+      ["2", "Mid Score"],
+      ["3", "Low Score"],
+      ["", "Still Pending"],
+    ]);
   });
 
   it("filters by stage", async () => {
@@ -178,23 +216,29 @@ describe("GET /api/jobs/[jobId]/export", () => {
   });
 
   it("returns a zip of the spreadsheets and the original CVs", async () => {
-    const { job } = await setup();
+    const { job, pending } = await setup();
     const res = await exportRequest(job.id, "format=zip");
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toBe("application/zip");
     expect(res.headers.get("content-disposition")).toMatch(/filename="senior-backend-engineer-candidates-2026-10-07\.zip"$/);
 
     const zip = await JSZip.loadAsync(await res.arrayBuffer());
-    const names = Object.keys(zip.files).sort();
-    expect(names).toEqual(
-      expect.arrayContaining([
-        "senior-backend-engineer-candidates-2026-10-07.csv",
-        "senior-backend-engineer-candidates-2026-10-07.xlsx",
-        "cvs/001-High-Score.pdf",
-        "cvs/004-Still-Pending.pdf",
-      ]),
-    );
+    const names = Object.keys(zip.files).filter((n) => !zip.files[n].dir).sort();
+    expect(names).toEqual([
+      "cvs/001-High-Score.pdf",
+      "cvs/002-Mid-Score.pdf",
+      "cvs/003-Low-Score.pdf",
+      `cvs/unranked-${pending.id.slice(0, 8)}-Still-Pending.pdf`,
+      "senior-backend-engineer-candidates-2026-10-07.csv",
+      "senior-backend-engineer-candidates-2026-10-07.xlsx",
+    ]);
     expect(await zip.file("cvs/001-High-Score.pdf")!.async("string")).toBe("%PDF-1.4 CV of High Score");
+  });
+
+  it("names a selected subset's CVs by their on-screen ranks", async () => {
+    const { job, low, high } = await setup();
+    const zip = await JSZip.loadAsync(await (await exportRequest(job.id, `format=zip&ids=${low.id},${high.id}`)).arrayBuffer());
+    expect(zip.file(/^cvs\//).map((f) => f.name)).toEqual(["cvs/001-High-Score.pdf", "cvs/003-Low-Score.pdf"]);
   });
 
   it("slugs awkward job titles into a safe ASCII file name", async () => {
@@ -211,5 +255,88 @@ describe("GET /api/jobs/[jobId]/export", () => {
     const long = await titled("Principal ".repeat(10));
     expect(long.split("-candidates-")[0].length).toBeLessThanOrEqual(50);
     expect(long).toMatch(/^principal-principal(-principal)*-candidates-2026-10-07\.csv$/);
+  });
+});
+
+describe("POST /api/jobs/[jobId]/export", () => {
+  it("returns 401 when signed out", async () => {
+    const { job, high } = await setup();
+    signInAs(null);
+    expect((await postExport(job.id, { format: "csv", ids: high.id })).status).toBe(401);
+  });
+
+  it("returns 403 for a cross-origin request", async () => {
+    const { job, high } = await setup();
+    const res = await postExport(job.id, { format: "csv", ids: high.id }, "https://evil.example");
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: expect.any(String) });
+  });
+
+  it("returns 404 for another company's job", async () => {
+    const { job, high } = await setup();
+    signInAs(makeCompany().company);
+    expect((await postExport(job.id, { format: "csv", ids: high.id })).status).toBe(404);
+  });
+
+  it("exports the ids in the body, ranked, with the same download headers as GET", async () => {
+    const { job, low, high } = await setup();
+    const res = await postExport(job.id, { format: "csv", ids: `${low.id}, ${high.id}` });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/csv; charset=utf-8");
+    expect(res.headers.get("content-disposition")).toBe(
+      'attachment; filename="senior-backend-engineer-candidates-2026-10-07.csv"',
+    );
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await csvRankedNames(res)).toEqual([
+      ["1", "High Score"],
+      ["3", "Low Score"],
+    ]);
+  });
+
+  it("accepts up to 1000 ids (more than GET allows) and honours the stage", async () => {
+    const { job, low, high, mid } = await setup();
+    const ids = [...randomIds(997), low.id, high.id, mid.id].join(",");
+    const res = await postExport(job.id, { format: "csv", stage: "shortlisted", ids });
+    expect(res.status).toBe(200);
+    expect(await csvNames(res)).toEqual(["High Score", "Mid Score"]);
+  });
+
+  it("returns a streamed zip", async () => {
+    const { job, high } = await setup();
+    const res = await postExport(job.id, { format: "zip", ids: high.id });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/zip");
+    const zip = await JSZip.loadAsync(await res.arrayBuffer());
+    expect(await zip.file("cvs/001-High-Score.pdf")!.async("string")).toBe("%PDF-1.4 CV of High Score");
+  });
+
+  it("rejects bad fields with 400 JSON, including more than 1000 ids", async () => {
+    const { job, high } = await setup();
+    for (const fields of <Record<string, string>[]>[
+      { format: "csv" },
+      { format: "csv", ids: "" },
+      { format: "pdf", ids: high.id },
+      { format: "csv", stage: "hired", ids: high.id },
+      { format: "csv", ids: `${high.id},not-a-uuid` },
+    ]) {
+      const res = await postExport(job.id, fields);
+      expect(res.status, JSON.stringify(fields).slice(0, 60)).toBe(400);
+      expect(await res.json()).toEqual({ error: expect.any(String) });
+    }
+  });
+
+  it("rejects more than 1000 ids", async () => {
+    const { job, high } = await setup();
+    const res = await postExport(job.id, { format: "csv", ids: [...randomIds(1000), high.id].join(",") });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "You can export at most 1000 selected candidates." });
+  });
+
+  it("returns 413 for a body over 64 KB", async () => {
+    const { job } = await setup();
+    const res = await postExport(job.id, { format: "csv", ids: randomIds(2000).join(",") });
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: expect.any(String) });
   });
 });

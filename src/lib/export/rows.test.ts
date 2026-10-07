@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Candidate } from "@/db/schema";
 import type { CandidateProfile, Evaluation } from "@/lib/ai/schemas";
+import type { RankedCandidate } from "@/lib/data/candidates";
 import { EXPORT_COLUMNS, neutralizeFormula, toExportRows } from "./rows";
 
 const profile: CandidateProfile = {
@@ -35,7 +35,7 @@ const evaluation: Evaluation = {
   recommendation: "strong_fit",
 };
 
-function candidate(overrides: Partial<Candidate> = {}): Candidate {
+function candidate(overrides: Partial<RankedCandidate> = {}): RankedCandidate {
   return {
     id: crypto.randomUUID(),
     jobId: "job",
@@ -48,7 +48,7 @@ function candidate(overrides: Partial<Candidate> = {}): Candidate {
     cvFileName: "cv.pdf",
     cvMimeType: "application/pdf",
     cvSize: 100,
-    cvText: null,
+    cvSha256: null,
     profile: null,
     evaluation: null,
     score: null,
@@ -57,8 +57,10 @@ function candidate(overrides: Partial<Candidate> = {}): Candidate {
     aiProvider: null,
     aiModel: null,
     stage: "new",
+    attempts: 0,
     createdAt: new Date("2026-03-04T23:30:00Z"),
     processedAt: null,
+    rank: null,
     ...overrides,
   };
 }
@@ -77,6 +79,7 @@ const ready = () =>
     aiModel: "gemini-2.5-flash",
     stage: "shortlisted",
     cvFileName: "Jose CV.pdf",
+    rank: 1,
   });
 
 describe("toExportRows", () => {
@@ -112,14 +115,14 @@ describe("toExportRows", () => {
       "Analysis status": "Ranked",
       "Added on": "2026-03-04",
       "CV file": "Jose CV.pdf",
-      "Ranked by": "gemini / gemini-2.5-flash",
+      "Ranked by": "Google Gemini / gemini-2.5-flash",
     });
   });
 
   it("leaves AI cells empty for a pending candidate without a profile or evaluation", () => {
     const [row] = toExportRows([candidate({ cvFileName: "upload.docx" })]);
     expect(row).toMatchObject({
-      Rank: 1,
+      Rank: null,
       Name: "upload.docx",
       Email: null,
       Phone: null,
@@ -163,13 +166,26 @@ describe("toExportRows", () => {
     expect(row.Education).toBe("Physics — MIT");
   });
 
-  it("numbers rows by their position in the given (ranked) list", () => {
-    const rows = toExportRows([candidate({ name: "A" }), candidate({ name: "B" }), candidate({ name: "C" })]);
-    expect(rows.map((r) => [r.Rank, r.Name])).toEqual([
-      [1, "A"],
-      [2, "B"],
-      [3, "C"],
+  it("uses each candidate's own rank, so an exported subset keeps the on-screen ranks", () => {
+    const rows = toExportRows([
+      candidate({ name: "A", score: 90, rank: 2 }),
+      candidate({ name: "B", score: 60, rank: 5 }),
+      candidate({ name: "C", rank: null }),
     ]);
+    expect(rows.map((r) => [r.Rank, r.Name])).toEqual([
+      [2, "A"],
+      [5, "B"],
+      [null, "C"],
+    ]);
+  });
+
+  it("labels the provider for humans and keeps unknown provider ids as-is", () => {
+    const rows = toExportRows([
+      candidate({ aiProvider: "anthropic", aiModel: "claude-x" }),
+      candidate({ aiProvider: "legacy-llm", aiModel: null }),
+      candidate({ aiProvider: null, aiModel: "orphan-model" }),
+    ]);
+    expect(rows.map((r) => r["Ranked by"])).toEqual(["Anthropic Claude / claude-x", "legacy-llm", "orphan-model"]);
   });
 });
 
@@ -185,6 +201,21 @@ describe("neutralizeFormula", () => {
   it("leaves digits-only values such as phone numbers untouched", () => {
     for (const s of ["+234 803 555 0142", "+1 (555) 010-9999", "-5", "+44 20 7946 0000"]) {
       expect(neutralizeFormula(s)).toBe(s);
+    }
+  });
+
+  it("gives long values no digits-only exemption, so digits can't smuggle a formula past it", () => {
+    const smuggled = `+${"1".repeat(80)}=HYPERLINK("http://evil.example")`;
+    expect(neutralizeFormula(smuggled)).toBe(`'${smuggled}`);
+    expect(neutralizeFormula(`+${"1".repeat(80)}`)).toBe(`'+${"1".repeat(80)}`);
+    expect(neutralizeFormula("1".repeat(80))).toBe("1".repeat(80));
+  });
+
+  it("stays linear on long digit runs (no catastrophic backtracking)", () => {
+    for (const s of ["1".repeat(100_000), `+${"1".repeat(100_000)}`, `-${"1".repeat(99_998)}x`, `${"1 ".repeat(50_000)}x`]) {
+      const start = performance.now();
+      neutralizeFormula(s);
+      expect(performance.now() - start, s.slice(0, 3)).toBeLessThan(50);
     }
   });
 });

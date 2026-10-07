@@ -1,6 +1,12 @@
 import "server-only";
-import type { Candidate } from "@/db/schema";
-import { CANDIDATE_SOURCE_LABELS, CANDIDATE_STAGE_LABELS, CANDIDATE_STATUS_LABELS, RECOMMENDATION_LABELS } from "@/lib/format";
+import type { RankedCandidate } from "@/lib/data/candidates";
+import {
+  CANDIDATE_SOURCE_LABELS,
+  CANDIDATE_STAGE_LABELS,
+  CANDIDATE_STATUS_LABELS,
+  RECOMMENDATION_LABELS,
+  aiProviderLabel,
+} from "@/lib/format";
 
 export const EXPORT_COLUMNS = [
   "Rank",
@@ -38,6 +44,10 @@ export type ExportColumn = (typeof EXPORT_COLUMNS)[number];
 export type ExportCell = string | number | null;
 export type ExportRow = Record<ExportColumn, ExportCell>;
 
+const DIGITS_ONLY = /^[+-]?[\d\s()./-]*\d[\d\s()./-]*$/;
+// DIGITS_ONLY backtracks quadratically on a long digit run that fails at the end (20k digits ≈ 650 ms).
+const MAX_DIGITS_ONLY_CHARS = 64;
+
 /**
  * CV content is attacker-controlled: a cell starting with one of these is run as a formula by
  * Excel/Sheets/LibreOffice (e.g. =HYPERLINK exfiltration), so it's prefixed with ' to force text.
@@ -45,7 +55,9 @@ export type ExportRow = Record<ExportColumn, ExportCell>;
 export function neutralizeFormula(value: string): string {
   // Intentional: digits-only values (phone numbers like "+234 803 555 0142", "-5") can't call functions,
   // so they pass through — prefixing them would put a stray apostrophe in every international phone number.
-  if (/^[+-]?[\d\s()./-]*\d[\d\s()./-]*$/.test(value)) return value;
+  // Only short values qualify: longer ones get no exemption rather than a truncated test, which could pass
+  // "+<64 digits>=HYPERLINK(…)" as a phone number.
+  if (value.length <= MAX_DIGITS_ONLY_CHARS && DIGITS_ONLY.test(value)) return value;
   return /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
 }
 
@@ -60,9 +72,12 @@ const num = (value: number | null | undefined): number | null =>
 const list = (values: string[] | null | undefined, separator: string): string | null =>
   text((values ?? []).filter((v) => v && v.trim()).join(separator));
 
-/** Ranked order in, one row per candidate out. Null-safe for candidates still pending or failed. */
-export function toExportRows(candidates: Candidate[]): ExportRow[] {
-  return candidates.map((c, i) => {
+/**
+ * Ranked order in, one row per candidate out. Rank is the candidate's own (job- or stage-wide) rank, so an
+ * exported subset keeps the ranks shown on screen; empty when unscored. Null-safe for pending/failed candidates.
+ */
+export function toExportRows(candidates: RankedCandidate[]): ExportRow[] {
+  return candidates.map((c) => {
     const p = c.profile;
     const e = c.evaluation;
     const role = p?.experience?.[0];
@@ -77,7 +92,7 @@ export function toExportRows(candidates: Candidate[]): ExportRow[] {
     }
 
     return {
-      Rank: i + 1,
+      Rank: c.rank,
       Name: text(c.name, p?.fullName, c.cvFileName),
       Email: text(c.email, p?.email),
       Phone: text(c.phone, p?.phone),
@@ -105,7 +120,7 @@ export function toExportRows(candidates: Candidate[]): ExportRow[] {
       "Analysis status": c.status === "failed" && c.error ? `${status}: ${c.error}` : status,
       "Added on": c.createdAt.toISOString().slice(0, 10),
       "CV file": c.cvFileName,
-      "Ranked by": list([c.aiProvider ?? "", c.aiModel ?? ""], " / "),
+      "Ranked by": list([c.aiProvider ? aiProviderLabel(c.aiProvider) : "", c.aiModel ?? ""], " / "),
     };
   });
 }

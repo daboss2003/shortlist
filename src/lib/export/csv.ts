@@ -3,10 +3,23 @@ import { neutralizeFormula, type ExportCell } from "./rows";
 
 const BOM = "﻿";
 
+/**
+ * Excel in semicolon-separator locales splits an unquoted CSV line on ";", so every ";" can start a new cell:
+ * each part after one gets the same formula guard (after its leading spaces), e.g. `Jo;=X` → `Jo;'=X`.
+ */
+function neutralizeCsvText(value: string): string {
+  const [first, ...rest] = neutralizeFormula(value).split(";");
+  const guarded = rest.map((part) => {
+    const lead = /^\s*/.exec(part)![0];
+    return lead + neutralizeFormula(part.slice(lead.length));
+  });
+  return [first, ...guarded].join(";");
+}
+
 function field(value: ExportCell | undefined): string {
   if (value === null || value === undefined) return "";
   if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
-  const safe = neutralizeFormula(value);
+  const safe = neutralizeCsvText(value);
   return /[",\r\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
 }
 

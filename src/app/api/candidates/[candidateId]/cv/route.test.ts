@@ -61,6 +61,29 @@ describe("GET /api/candidates/[candidateId]/cv", () => {
     expect(Buffer.from(await res.arrayBuffer()).equals(pdfBytes)).toBe(true);
   });
 
+  it("names the download after the stored type, not the uploaded extension", async () => {
+    const cases: Array<[uploaded: string, downloaded: string]> = [
+      ["cv.docx", "cv.pdf"],
+      ["Resume", "Resume.pdf"],
+      ["CV v2.1", "CV v2.1.pdf"],
+      ["scan.PDF", "scan.PDF"],
+      [".docx", "cv.pdf"],
+    ];
+    for (const [uploaded, downloaded] of cases) {
+      const { company, candidate } = await makeCandidate(uploaded);
+      mocks.employer = employerFor(company.id);
+      expect(candidate.cvFileName).toBe(uploaded);
+
+      const res = await download(candidate.id);
+
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe("application/pdf");
+      expect(res.headers.get("content-disposition"), uploaded).toBe(
+        `attachment; filename="${downloaded}"; filename*=UTF-8''${encodeURIComponent(downloaded)}`,
+      );
+    }
+  });
+
   it("returns 404 for another company's candidate", async () => {
     const { candidate } = await makeCandidate("cv.pdf");
     const other = makeCompany();

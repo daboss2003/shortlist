@@ -23,11 +23,23 @@ export async function GET(_request: Request, ctx: RouteContext<"/api/candidates/
     headers: {
       "Content-Type": candidate.cvMimeType,
       "Content-Length": String(bytes.length),
-      "Content-Disposition": contentDisposition(candidate.cvFileName),
+      "Content-Disposition": contentDisposition(downloadName(candidate.cvFileName, candidate.cvFileKey)),
       "X-Content-Type-Options": "nosniff",
       "Cache-Control": "private, no-store",
     },
   });
+}
+
+/**
+ * The stored type (sniffed from the bytes at upload, kept as the key's extension) decides the extension, so a
+ * PDF uploaded as "cv.docx" downloads as "cv.pdf" and opens in the right app. A trailing ".1" (as in "CV v2.1")
+ * isn't treated as an extension.
+ */
+function downloadName(fileName: string, key: string): string {
+  const ext = key.slice(key.lastIndexOf(".") + 1);
+  if (fileName.toLowerCase().endsWith(`.${ext}`)) return fileName;
+  const stem = fileName.replace(/\.[A-Za-z][A-Za-z0-9]{0,4}$/, "") || "cv";
+  return `${stem}.${ext}`;
 }
 
 /** RFC 6266: an ASCII-only fallback plus the exact UTF-8 name (RFC 5987) for modern browsers. */
