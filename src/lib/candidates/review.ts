@@ -25,7 +25,8 @@ export async function setCandidatesStage(
 }
 
 /**
- * Re-queues candidates for AI analysis: status → pending, error cleared, attempts reset.
+ * Re-queues candidates for AI analysis: status → pending, error cleared, attempts and busy-AI retries reset.
+ * claim_token/claimed_at are kept (process-cv event ids are derived from them; see processEventId).
  * Returns the ids to pass to scheduleCandidateProcessing().
  */
 export async function markForRescore(companyId: string, jobId: string, ids: string[] | "all"): Promise<string[]> {
@@ -38,7 +39,7 @@ export async function markForRescore(companyId: string, jobId: string, ids: stri
   // when cvText exists, and the stale ranking stays visible until the new one lands.
   const rows = await db
     .update(candidates)
-    .set({ status: "pending", error: null, attempts: 0 })
+    .set({ status: "pending", error: null, attempts: 0, aiRetries: 0 })
     .where(and(...where))
     .returning({ id: candidates.id });
   return rows.map((row) => row.id);

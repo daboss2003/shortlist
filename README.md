@@ -81,7 +81,7 @@ Configured entirely by environment variables. Set one or more keys:
 
 | Provider | Key | Default model (override) |
 |---|---|---|
-| Google Gemini (**default**) | `GEMINI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY` | `gemini-3.8-flash` (`GEMINI_MODEL`) |
+| Google Gemini (**default**) | `GEMINI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY` | `gemini-3.8-flash,gemini-3.5-flash-lite` (`GEMINI_MODEL`) |
 | OpenAI | `OPENAI_API_KEY` | `gpt-5.4-mini` (`OPENAI_MODEL`) |
 | Anthropic Claude | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` (`ANTHROPIC_MODEL`) |
 | Groq | `GROQ_API_KEY` | `openai/gpt-oss-120b` (`GROQ_MODEL`) |
@@ -89,7 +89,12 @@ Configured entirely by environment variables. Set one or more keys:
 
 - **Which one is used:** `AI_PROVIDER` if set. Otherwise Gemini if its key is present, otherwise the first configured
   provider in the order above.
-- **Fallback:** if the chosen provider fails, the other configured providers are tried in order. Turn this off with `AI_FALLBACK=false`.
+- **Fallback:** every `*_MODEL` variable accepts a comma-separated list (e.g. `GEMINI_MODEL=gemini-3.8-flash,gemini-3.5-flash-lite`).
+  The chosen provider's models are tried in order, then the other configured providers'. `AI_FALLBACK=false` keeps
+  only the first model.
+- **Busy models:** when every model is temporarily overloaded (HTTP 429/503 "high demand"), the CV isn't failed. It goes
+  back to the queue marked *Retrying*, its daily-cap charge is refunded, and it's retried automatically (about every
+  5 minutes locally, 30 minutes on Netlify). It's marked *Failed* on the 12th busy try.
 - **Fairness:** companies take turns, so one company's big re-score can't starve the others.
 - **Daily cap:** `AI_DAILY_LIMIT` (default 500) AI analyses per company per UTC day, with re-scores included; `0` means
   unlimited. CVs over the cap wait and are picked up after the day rolls over.

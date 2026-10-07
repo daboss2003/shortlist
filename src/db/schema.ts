@@ -135,6 +135,9 @@ export const candidates = pgTable(
     // the requeue cron recover rows stuck in "processing" after an outage.
     claimToken: text("claim_token"),
     claimedAt: ts("claimed_at"),
+    // Times the CV went back to the queue because every AI model was temporarily unavailable (429/503 overload).
+    // Bounded so a long outage ends in "failed" instead of retrying forever; a re-score resets it.
+    aiRetries: integer("ai_retries").notNull().default(0),
     createdAt: createdAt(),
     processedAt: ts("processed_at"),
   },

@@ -4,7 +4,7 @@ import { useId, useState, useTransition } from "react";
 import Link from "next/link";
 import { unstable_rethrow } from "next/navigation";
 import { Check, CheckCircle2, Download, Loader2, RefreshCw, Trash2, Undo2, X } from "lucide-react";
-import { RecommendationBadge, SourceBadge, StageBadge, StatusBadge } from "@/components/candidate/badges";
+import { RecommendationBadge, SourceBadge, StageBadge, StatusBadge, isRetryingBusyAi } from "@/components/candidate/badges";
 import { ScoreBadge } from "@/components/candidate/score-badge";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -494,6 +494,8 @@ export function CandidatesTable({
 }
 
 function ScoreCell({ row }: { row: CandidateRow }) {
+  // A queued CV with a note is waiting for a busy AI service to recover, not being analyzed right now.
+  if (isRetryingBusyAi(row.status, row.error)) return <StatusBadge status={row.status} error={row.error} />;
   if (row.status === "pending" || row.status === "processing") {
     return (
       <span className="inline-flex items-center gap-1.5 whitespace-nowrap text-ink-muted">

@@ -1,4 +1,5 @@
 import { eq, sql } from "drizzle-orm";
+import { APICallError } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { db } from "@/db";
 import { candidates, type Candidate, type Job } from "@/db/schema";
@@ -62,12 +63,33 @@ export function modelResult(result: CvAnalysis = analysis) {
 export const workingModel = (result: CvAnalysis = analysis) =>
   new MockLanguageModelV4({ doGenerate: async () => modelResult(result) });
 
-export const failingModel = (message = "upstream overloaded") =>
+/** Fails with a plain error. The default message reads as a permanent failure (no "overloaded" or "rate limit"). */
+export const failingModel = (message = "the model rejected the request") =>
   new MockLanguageModelV4({
     doGenerate: async () => {
       throw new Error(message);
     },
   });
+
+/**
+ * Answers every call with an HTTP error, as a provider's API would. `retry-after-ms: 0` lets the AI SDK's own retries
+ * (ending in a RetryError) run without their seconds of backoff.
+ */
+export const httpErrorModel = (statusCode: number, message = `HTTP ${statusCode} from the provider`) =>
+  new MockLanguageModelV4({
+    doGenerate: async () => {
+      throw new APICallError({
+        message,
+        url: "https://api.example.com/v1/generate",
+        requestBodyValues: {},
+        statusCode,
+        responseHeaders: { "retry-after-ms": "0" },
+      });
+    },
+  });
+
+/** Gemini's answer when a model is overloaded: transient, so the CV should wait rather than fail. */
+export const busyModel = () => httpErrorModel(503, "This model is currently experiencing high demand. Please try again later.");
 
 export const providerWith = (id: ResolvedProvider["id"], model: MockLanguageModelV4): ResolvedProvider => ({
   id,

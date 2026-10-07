@@ -122,6 +122,22 @@ describe("markForRescore", () => {
     expect(await getRow(a2.id)).toMatchObject({ status: "pending", attempts: 0 });
   });
 
+  it("resets the busy-AI retry count and its note, keeping the claim token and time", async () => {
+    const { a, jobA, a1, a2, b1 } = await twoTenants();
+    const claimedAt = new Date("2026-10-07T09:00:00Z");
+    const busy = "The AI service is busy — this CV will be retried automatically.";
+    await setRow(a1.id, { status: "pending", error: busy, aiRetries: 7, claimToken: "run-7", claimedAt });
+    await setRow(a2.id, { status: "failed", error: "The AI service couldn't analyze this CV right now.", aiRetries: 12 });
+    await setRow(b1.id, { status: "pending", error: busy, aiRetries: 3 });
+
+    await markForRescore(a.company.id, jobA.id, [a1.id, a2.id, b1.id]);
+
+    expect(await getRow(a1.id)).toMatchObject({ status: "pending", error: null, aiRetries: 0, claimToken: "run-7", claimedAt });
+    expect(await getRow(a2.id)).toMatchObject({ status: "pending", error: null, aiRetries: 0 });
+    // Another company's candidate is untouched.
+    expect(await getRow(b1.id)).toMatchObject({ error: busy, aiRetries: 3 });
+  });
+
   it("'all' covers every candidate of that job only", async () => {
     const { a, jobA, a1, a2, b1 } = await twoTenants();
     const otherJob = await makeJob(a.company.id);

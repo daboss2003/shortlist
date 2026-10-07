@@ -21,6 +21,9 @@ export const CANDIDATE_STATUS_LABELS: Record<CandidateStatus, string> = {
   failed: "Failed",
 };
 
+/** A pending CV that carries a note: it went back to the queue because the AI was busy, and will be retried. */
+export const CANDIDATE_RETRYING_LABEL = "Retrying";
+
 export const CANDIDATE_STAGE_LABELS: Record<CandidateStage, string> = {
   new: "New",
   shortlisted: "Shortlisted",

@@ -15,7 +15,10 @@ import { purgeExpiredCandidateData } from "@/lib/retention";
 // ids only, and everything that can throw runs inside withSafeErrors (a database error's message carries the
 // query's data).
 
-/** Claim → extract → reserve quota → analyze and save (one step per provider, falling back in order), for one CV. */
+/**
+ * Claim → extract → reserve quota → analyze and save (one step per model of the chain, falling back in order), for one
+ * CV. When every model was only busy, a last step puts the CV back to pending for the requeue-pending cron.
+ */
 export const processCv = inngest.createFunction(
   {
     id: "process-cv",

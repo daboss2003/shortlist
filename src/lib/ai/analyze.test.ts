@@ -1,8 +1,15 @@
+import { APICallError } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Job } from "@/db/schema";
 import type { CvAnalysis } from "@/lib/ai/schemas";
-import { AiAnalysisError, AiNotConfiguredError, analyzeCv, analyzeCvWithProvider } from "./analyze";
+import {
+  AiAnalysisError,
+  AiNotConfiguredError,
+  AiTemporarilyUnavailableError,
+  analyzeCv,
+  analyzeCvWithProvider,
+} from "./analyze";
 import { RECOMMENDATION_MIN_SCORES, buildAnalysisPrompt } from "./prompt";
 import type { ResolvedProvider } from "./providers";
 
@@ -80,6 +87,24 @@ function failingModel(message: string) {
   return new MockLanguageModelV4({
     doGenerate: async () => {
       throw new Error(message);
+    },
+  });
+}
+
+/**
+ * Answers every call with an HTTP error, as a provider's API would. `retry-after-ms: 0` lets the AI SDK's own retries
+ * (which end in a RetryError) run without their usual seconds of backoff.
+ */
+function httpErrorModel(statusCode: number, message = `HTTP ${statusCode} from the provider`) {
+  return new MockLanguageModelV4({
+    doGenerate: async () => {
+      throw new APICallError({
+        message,
+        url: "https://api.example.com/v1/generate",
+        requestBodyValues: {},
+        statusCode,
+        responseHeaders: { "retry-after-ms": "0" },
+      });
     },
   });
 }
@@ -181,6 +206,46 @@ describe("analyzeCv", () => {
     expect(logged).not.toContain("sk-proj");
   });
 
+  it("tries each model of a provider in turn, and reports the one that answered", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const flash = httpErrorModel(503, "This model is currently experiencing high demand.");
+    const lite = mockModel(analysis());
+
+    const result = await analyzeCv({ cvText, job }, [
+      { id: "gemini", label: "Google Gemini", modelId: "gemini-3.8-flash", model: flash },
+      { id: "gemini", label: "Google Gemini", modelId: "gemini-3.5-flash-lite", model: lite },
+    ]);
+
+    expect(result).toMatchObject({ provider: "gemini", modelId: "gemini-3.5-flash-lite" });
+    // The AI SDK's own retries (maxRetries: 2) ran before moving on.
+    expect(flash.doGenerateCalls).toHaveLength(3);
+  });
+
+  it("throws AiTemporarilyUnavailableError when every model was only busy", async () => {
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const promise = analyzeCv({ cvText, job }, [
+      provider("gemini", "Google Gemini", httpErrorModel(503, "This model is currently experiencing high demand.")),
+      provider("openai", "OpenAI", httpErrorModel(429)),
+      provider("anthropic", "Anthropic Claude", failingModel("Overloaded")),
+    ]);
+
+    await expect(promise).rejects.toBeInstanceOf(AiTemporarilyUnavailableError);
+    const err = (await promise.catch((e: unknown) => e)) as Error;
+    expect(err).not.toBeInstanceOf(AiAnalysisError);
+    expect(err.message).toBe("The AI service is busy — this CV will be retried automatically.");
+    const logged = errorLog.mock.calls.map((args) => args.join(" ")).join("\n");
+    expect(logged).toContain("gemini (gemini-model) failed [transient-503]: HTTP 503 This model is currently experiencing high demand.");
+  });
+
+  it.each([404, 401])("throws AiAnalysisError when any model failed for good (HTTP %s), even if the rest were busy", async (status) => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const promise = analyzeCv({ cvText, job }, [
+      provider("gemini", "Google Gemini", httpErrorModel(503)),
+      provider("openai", "OpenAI", httpErrorModel(status)),
+    ]);
+    await expect(promise).rejects.toBeInstanceOf(AiAnalysisError);
+  });
+
   it("fails when the model output doesn't match the schema", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const promise = analyzeCv({ cvText, job }, [provider("gemini", "Google Gemini", mockModel({ nope: true }))]);
@@ -276,6 +341,28 @@ describe("analyzeCvWithProvider", () => {
     const reason = attempt.ok ? "" : attempt.reason;
     expect(reason).toMatch(/^bad key \[redacted\] x+…$/);
     expect(reason.length).toBeLessThanOrEqual(200);
+    expect(attempt).toMatchObject({ code: "provider-error" });
+  });
+
+  it("classifies a busy model's failure, after the AI SDK's own retries, as transient", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const busy = httpErrorModel(503, "This model is currently experiencing high demand.");
+    const attempt = await analyzeCvWithProvider({ cvText, job }, provider("gemini", "Google Gemini", busy));
+
+    expect(attempt).toEqual({
+      ok: false,
+      reason: "HTTP 503 This model is currently experiencing high demand.",
+      code: "transient-503",
+    });
+    expect(busy.doGenerateCalls).toHaveLength(3);
+
+    const missing = httpErrorModel(404, "models/gemini-9 is not found");
+    expect(await analyzeCvWithProvider({ cvText, job }, provider("gemini", "Google Gemini", missing))).toMatchObject({
+      ok: false,
+      code: "http-404",
+    });
+    // Not retried: the same request would fail the same way.
+    expect(missing.doGenerateCalls).toHaveLength(1);
   });
 
   it("gives up after its own timeout", async () => {
@@ -286,7 +373,7 @@ describe("analyzeCvWithProvider", () => {
     });
     const started = performance.now();
     const attempt = await analyzeCvWithProvider({ cvText, job }, provider("groq", "Groq", hanging), { timeoutMs: 50 });
-    expect(attempt).toEqual({ ok: false, reason: "timed out after 0.05s" });
+    expect(attempt).toEqual({ ok: false, reason: "timed out after 0.05s", code: "transient-timeout" });
     expect(performance.now() - started).toBeLessThan(2000);
   });
 });

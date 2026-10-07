@@ -60,6 +60,7 @@ function candidate(overrides: Partial<RankedCandidate> = {}): RankedCandidate {
     attempts: 0,
     claimToken: null,
     claimedAt: null,
+    aiRetries: 0,
     createdAt: new Date("2026-03-04T23:30:00Z"),
     processedAt: null,
     rank: null,

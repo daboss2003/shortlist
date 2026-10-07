@@ -4,7 +4,7 @@ import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ArrowLeft, FileText, Globe, Loader2, Mail, MapPin, Phone } from "lucide-react";
-import { SourceBadge, StageBadge, StatusBadge } from "@/components/candidate/badges";
+import { SourceBadge, StageBadge, StatusBadge, isRetryingBusyAi } from "@/components/candidate/badges";
 import { Card } from "@/components/ui/card";
 import { Alert, EmptyState, LoadingBlock } from "@/components/ui/feedback";
 import { getCurrentEmployer, requireEmployer } from "@/lib/auth/dal";
@@ -82,7 +82,14 @@ async function CandidateDetail({ params }: Props) {
         </div>
 
         {analyzing && (
-          <Alert tone="info" title="Analyzing this CV — this usually takes under a minute.">
+          <Alert
+            tone="info"
+            title={
+              isRetryingBusyAi(status, candidate.error)
+                ? candidate.error
+                : "Analyzing this CV — this usually takes under a minute."
+            }
+          >
             {evaluation
               ? "The results below are from the previous analysis. This page updates on its own."
               : "This page updates on its own."}

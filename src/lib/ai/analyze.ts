@@ -1,14 +1,17 @@
 import "server-only";
 import { APICallError, NoObjectGeneratedError, Output, RetryError, generateText } from "ai";
 import type { Job } from "@/db/schema";
+import { aiFailureCode, isTransientAiFailure, type AiFailureCode } from "@/lib/ai/errors";
 import { RECOMMENDATION_MIN_SCORES, buildAnalysisPrompt } from "@/lib/ai/prompt";
 import { resolveProviderChain, type ResolvedProvider } from "@/lib/ai/providers";
 import { cvAnalysisSchema, type CvAnalysis, type Recommendation } from "@/lib/ai/schemas";
 import type { AiProviderId } from "@/lib/ai/status";
 
-// Both messages are shown to employers: no env var names, no provider errors (those go to the server log).
+// These messages are shown to employers: no env var names, no provider errors (those go to the server log).
 const NOT_CONFIGURED_MESSAGE = "AI ranking isn't set up yet.";
-const ANALYSIS_FAILED_MESSAGE = "The AI service couldn't analyze this CV right now. Try re-scoring it later.";
+export const ANALYSIS_FAILED_MESSAGE = "The AI service couldn't analyze this CV right now. Try re-scoring it later.";
+/** Stored as the error of a CV that went back to the queue because every model was busy (see releaseForBusyAi). */
+export const AI_BUSY_MESSAGE = "The AI service is busy — this CV will be retried automatically.";
 
 /** No provider key in env. Message is safe to show to the employer. */
 export class AiNotConfiguredError extends Error {
@@ -24,11 +27,24 @@ export class AiAnalysisError extends Error {
   }
 }
 
+/**
+ * Every model failed, each for a reason that may clear on its own (overload, rate limit, timeout, network): the CV
+ * should wait and be retried rather than fail. Message is safe to show to the employer.
+ */
+export class AiTemporarilyUnavailableError extends Error {
+  constructor() {
+    super(AI_BUSY_MESSAGE);
+  }
+}
+
 /** Plain JSON (no Dates, no undefined), so it can be a durable step's result. */
 export type AnalyzeResult = { analysis: CvAnalysis; provider: AiProviderId; modelId: string };
 
-/** One provider's answer. `reason` is redacted and short: safe for logs and step results, not for employers. */
-export type ProviderAttempt = { ok: true; result: AnalyzeResult } | { ok: false; reason: string };
+/**
+ * One model's answer. `reason` is redacted and short: safe for logs, not for employers or step results (it can quote
+ * the provider's message). `code` carries no provider text: safe anywhere.
+ */
+export type ProviderAttempt = { ok: true; result: AnalyzeResult } | { ok: false; reason: string; code: AiFailureCode };
 
 export type AnalyzeInput = { cvText: string; job: Job };
 
@@ -37,19 +53,24 @@ const MAX_LISTED = 5;
 /** Longer model-supplied emails or links are dropped, which also bounds the regex work on them. */
 const MAX_CHECKED_CHARS = 500;
 
-/** Extracts a profile and scores the CV against the job, trying each provider in order. */
+/**
+ * Extracts a profile and scores the CV against the job, trying each model of the chain in order. Throws
+ * AiTemporarilyUnavailableError when every model failed for a transient reason, else AiAnalysisError.
+ */
 export async function analyzeCv(
   input: AnalyzeInput,
   chain: ResolvedProvider[] = resolveProviderChain().chain,
 ): Promise<AnalyzeResult> {
   if (chain.length === 0) throw new AiNotConfiguredError();
 
+  let allTransient = true;
   for (const provider of chain) {
     const attempt = await analyzeCvWithProvider(input, provider);
     if (attempt.ok) return attempt.result;
+    if (!isTransientAiFailure(attempt.code)) allTransient = false;
   }
 
-  throw new AiAnalysisError();
+  throw allTransient ? new AiTemporarilyUnavailableError() : new AiAnalysisError();
 }
 
 /**
@@ -78,8 +99,11 @@ export async function analyzeCvWithProvider(
     };
   } catch (err) {
     const reason = clip(redact(shortReason(err, timeoutMs)), 200);
-    console.error(`[ai] ${provider.id} (${provider.modelId}) failed: ${reason} | ${clip(redact(errorMessage(err)), 500)}`);
-    return { ok: false, reason };
+    const code = aiFailureCode(err);
+    console.error(
+      `[ai] ${provider.id} (${provider.modelId}) failed [${code}]: ${reason} | ${clip(redact(errorMessage(err)), 500)}`,
+    );
+    return { ok: false, reason, code };
   }
 }
 

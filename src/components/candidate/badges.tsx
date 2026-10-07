@@ -3,6 +3,7 @@ import { Badge, type BadgeTone } from "@/components/ui/badge";
 import type { CandidateSource, CandidateStage, CandidateStatus } from "@/db/schema";
 import type { Recommendation } from "@/lib/ai/schemas";
 import {
+  CANDIDATE_RETRYING_LABEL,
   CANDIDATE_SOURCE_LABELS,
   CANDIDATE_STAGE_LABELS,
   CANDIDATE_STATUS_LABELS,
@@ -16,13 +17,25 @@ const statusTones: Record<CandidateStatus, BadgeTone> = {
   failed: "danger",
 };
 
-/** AI pipeline state. Failed shows the error on hover. */
+/**
+ * A pending CV with an error note is waiting for a busy AI: every model was overloaded on its last try, and the
+ * pipeline will retry it on its own (the note says so).
+ */
+export function isRetryingBusyAi(status: CandidateStatus, error: string | null | undefined): error is string {
+  return status === "pending" && !!error;
+}
+
+/** AI pipeline state. Failed shows the error on hover; so does "Retrying" (pending, waiting for a busy AI). */
 export function StatusBadge({ status, error }: { status: CandidateStatus; error?: string | null }) {
+  const retrying = isRetryingBusyAi(status, error);
   return (
-    <Badge tone={statusTones[status]} title={status === "failed" && error ? error : undefined}>
+    <Badge
+      tone={retrying ? "warning" : statusTones[status]}
+      title={(status === "failed" || retrying) && error ? error : undefined}
+    >
       {status === "pending" && <Clock aria-hidden />}
       {status === "processing" && <Loader2 aria-hidden className="animate-spin" />}
-      {CANDIDATE_STATUS_LABELS[status]}
+      {retrying ? CANDIDATE_RETRYING_LABEL : CANDIDATE_STATUS_LABELS[status]}
     </Badge>
   );
 }

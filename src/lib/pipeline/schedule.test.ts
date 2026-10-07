@@ -11,7 +11,7 @@ import {
 } from "./index";
 import { executionMode } from "./runtime";
 import { claimStep, runProcessCvSteps, type StepRunner } from "./steps";
-import { CV_TEXT, makeCandidate, providerWith, reload, setRow, workingModel } from "./test-helpers";
+import { CV_TEXT, busyModel, makeCandidate, providerWith, reload, setRow, workingModel } from "./test-helpers";
 
 const mocks = vi.hoisted(() => ({
   send: vi.fn<(rows: Array<{ id: string; companyId: string; eventId: string }>) => Promise<void>>(),
@@ -328,6 +328,34 @@ describe("requeuePendingCandidates", () => {
 
     expect(await requeuePendingCandidates(NOW)).toBe(0);
     expect(mocks.send).not.toHaveBeenCalled();
+  });
+
+  it("re-sends a CV that went back to pending because every model was busy, under a new event id", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(minutesAgo(30));
+    // A cap of 1: the busy run's charge must have been refunded for the CV to be sent again today.
+    vi.stubEnv("AI_DAILY_LIMIT", "1");
+    try {
+      const job = await makeJob((await makeCompany()).company.id);
+      const c = await pendingCandidate(job, 60);
+      // The run its first event (`cv-<id>-new`) started.
+      expect(await runProcessCvSteps(c.id, "run-1", inline, [providerWith("gemini", busyModel())])).toBe("ai-busy");
+      expect(await reload(c.id)).toMatchObject({ status: "pending", aiRetries: 1 });
+
+      vi.setSystemTime(NOW);
+      expect(await requeuePendingCandidates(NOW)).toBe(1);
+
+      // Named after the busy run's claim: not the first event's id, so Inngest doesn't drop it.
+      expect(sentIds()).toEqual([c.id]);
+      expect(sentEventIds()).toEqual([`cv-${c.id}-run-1`]);
+      expect(sentEventIds()).not.toContain(processEventId(c.id, null));
+
+      // The run that event starts finds the AI back and finishes the CV.
+      expect(await runProcessCvSteps(c.id, "run-2", inline, [providerWith("gemini", workingModel())])).toBe("ready");
+      expect(await reload(c.id)).toMatchObject({ status: "ready", error: null });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sends at most 200 per run", async () => {

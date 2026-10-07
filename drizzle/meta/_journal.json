@@ -15,6 +15,13 @@
       "when": 1791393735338,
       "tag": "0001_claim_tracking",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791406080801,
+      "tag": "0002_ai_retries",
+      "breakpoints": true
     }
   ]
 }

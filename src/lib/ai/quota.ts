@@ -1,5 +1,5 @@
 import "server-only";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, gt, sql, type SQL } from "drizzle-orm";
 import { db } from "@/db";
 import { aiUsage } from "@/db/schema";
 
@@ -67,5 +67,31 @@ export async function tryReserveAnalysis(companyId: string, now: Date = new Date
     .values({ companyId, day: utcDay(now), analyses: 1 })
     .onConflictDoUpdate(chargeOnConflict())
     .returning({ analyses: aiUsage.analyses });
+  return rows.length > 0;
+}
+
+/**
+ * The UPDATE behind every refund: one analysis off `companyId`'s count for the UTC day of `now`, only while that count
+ * is above 0, so a refund can never take it negative. Returns a row only when something was taken off. `companyId`
+ * may be a subquery, so the pipeline can run this inside the statement that releases a claim (releaseForBusyAi in
+ * src/lib/pipeline/steps.ts).
+ */
+export function refundUsage(companyId: string | SQL, now: Date) {
+  return db
+    .update(aiUsage)
+    .set({ analyses: sql`${aiUsage.analyses} - 1` })
+    .where(and(eq(aiUsage.companyId, companyId), eq(aiUsage.day, utcDay(now)), gt(aiUsage.analyses, 0)))
+    .returning({ analyses: aiUsage.analyses });
+}
+
+/**
+ * Gives back one analysis of today's count (never below 0), for an analysis that was charged but never ran. Returns
+ * false when there was nothing to give back. Like tryReserveAnalysis, the pipeline doesn't call this directly: it
+ * refunds through releaseForBusyAi, which ties the refund to the claim's charge so it can't happen twice.
+ * Intentional: "today" is the day of the refund, not of the charge; the charge's day isn't recorded, and the two
+ * differ only for a claim that spans midnight UTC.
+ */
+export async function refundAnalysis(companyId: string, now: Date = new Date()): Promise<boolean> {
+  const rows = await refundUsage(companyId, now);
   return rows.length > 0;
 }

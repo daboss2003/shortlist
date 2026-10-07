@@ -1,16 +1,18 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { APICallError } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { db } from "@/db";
-import { candidates } from "@/db/schema";
-import { getAiQuota } from "@/lib/ai/quota";
+import { aiUsage, candidates } from "@/db/schema";
+import { getAiQuota, utcDay } from "@/lib/ai/quota";
 import { deleteCvFile } from "@/lib/storage";
 import { makeCompany, makeJob } from "../../../test/factories";
 import {
   CV_TEXT,
   analysis,
+  busyModel,
   failingModel,
+  httpErrorModel,
   makeCandidate,
   modelResult,
   providerWith,
@@ -21,11 +23,13 @@ import {
 import {
   GAVE_UP_MESSAGE,
   GENERIC_FAILURE_MESSAGE,
+  MAX_AI_RETRIES,
   UNREADABLE_CV_MESSAGE,
   analyzeStep,
   claimStep,
   extractStep,
   markFailed,
+  releaseForBusyAi,
   reserveQuotaStep,
   runProcessCvSteps,
   saveCvText,
@@ -33,6 +37,7 @@ import {
 } from "./steps";
 
 const AI_FAILED_MESSAGE = "The AI service couldn't analyze this CV right now. Try re-scoring it later.";
+const AI_BUSY_MESSAGE = "The AI service is busy — this CV will be retried automatically.";
 /** The claim token of the run under test (in production, its Inngest run id). */
 const RUN = "run-1";
 
@@ -82,7 +87,7 @@ describe("runProcessCvSteps", () => {
 
     expect(await runProcessCvSteps(c.id, RUN, step, [gemini(model)])).toBe("ready");
 
-    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-gemini"]);
+    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-0-gemini"]);
     expect(await reload(c.id)).toMatchObject({
       status: "ready",
       error: null,
@@ -123,7 +128,7 @@ describe("runProcessCvSteps", () => {
     const { ids, step } = recordingSteps();
 
     expect(await runProcessCvSteps(c.id, RUN, step, [gemini()])).toBe("ready");
-    expect(ids).toEqual(["claim", "reserve-quota", "analyze-gemini"]);
+    expect(ids).toEqual(["claim", "reserve-quota", "analyze-0-gemini"]);
     expect((await reload(c.id)).cvText).toBe(`${CV_TEXT}\nStored earlier`);
   });
 
@@ -135,7 +140,7 @@ describe("runProcessCvSteps", () => {
 
     expect(await runProcessCvSteps(c.id, RUN, step, [gemini(broken), providerWith("openai", working)])).toBe("ready");
 
-    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-gemini", "analyze-openai"]);
+    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-0-gemini", "analyze-1-openai"]);
     expect(broken.doGenerateCalls.length).toBeGreaterThan(0);
     expect(working.doGenerateCalls).toHaveLength(1);
     expect(await reload(c.id)).toMatchObject({ status: "ready", aiProvider: "openai", aiModel: "openai-test" });
@@ -165,7 +170,7 @@ describe("runProcessCvSteps", () => {
 
     expect(await runProcessCvSteps(c.id, RUN, step, chain)).toBe("ai-failed");
 
-    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-gemini", "analyze-groq", "mark-failed"]);
+    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-0-gemini", "analyze-1-groq", "mark-failed"]);
     expect(await reload(c.id)).toMatchObject({ status: "failed", error: AI_FAILED_MESSAGE, score: null, cvText: CV_TEXT });
   });
 
@@ -269,11 +274,11 @@ describe("runProcessCvSteps", () => {
     const model = workingModel();
     const c = await makeCandidate();
     const { ids, step } = recordingSteps(async (id) => {
-      if (id === "analyze-gemini") await setRow(c.id, { status: "pending", attempts: 0 });
+      if (id === "analyze-0-gemini") await setRow(c.id, { status: "pending", attempts: 0 });
     });
 
     expect(await runProcessCvSteps(c.id, RUN, step, [gemini(model)])).toBe("superseded");
-    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-gemini"]);
+    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-0-gemini"]);
     expect(model.doGenerateCalls).toHaveLength(0);
     expect((await reload(c.id)).status).toBe("pending");
   });
@@ -304,6 +309,163 @@ describe("runProcessCvSteps", () => {
 
     expect(await runProcessCvSteps(c.id, RUN, step, [gemini()])).toBe("ready");
     expect(lost).toBe(true);
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+});
+
+describe("runProcessCvSteps when every model is busy", () => {
+  it("puts the CV back to pending with a note, refunds its charge and doesn't count the attempt", async () => {
+    const c = await makeCandidate();
+    const { ids, results, step } = recordingSteps();
+    const chain = [gemini(busyModel()), providerWith("gemini", httpErrorModel(429)), providerWith("openai", failingModel("Overloaded"))];
+
+    expect(await runProcessCvSteps(c.id, RUN, step, chain)).toBe("ai-busy");
+
+    expect(ids).toEqual(["claim", "extract", "reserve-quota", "analyze-0-gemini", "analyze-1-gemini", "analyze-2-openai", "release-busy-ai"]);
+    expect(results.map((r) => r.json)).toEqual([
+      '{"claimed":true,"needsText":true}',
+      '"ok"',
+      '"reserved"',
+      '{"ok":false,"reason":"transient-503"}',
+      '{"ok":false,"reason":"transient-429"}',
+      '{"ok":false,"reason":"transient-busy"}',
+      '"requeued"',
+    ]);
+    expect(await reload(c.id)).toMatchObject({
+      status: "pending",
+      error: AI_BUSY_MESSAGE,
+      aiRetries: 1,
+      attempts: 0,
+      // Same claim generation, without the charge marker: the re-queue's event id is new (see processEventId).
+      claimToken: RUN,
+      cvText: CV_TEXT,
+      score: null,
+    });
+    expect((await getAiQuota(c.companyId)).used).toBe(0);
+  });
+
+  it("runs again on the next send, and a success clears the note", async () => {
+    const c = await makeCandidate();
+    expect(await runProcessCvSteps(c.id, "run-1", recordingSteps().step, [gemini(busyModel())])).toBe("ai-busy");
+    const { ids, step } = recordingSteps();
+
+    expect(await runProcessCvSteps(c.id, "run-2", step, [gemini()])).toBe("ready");
+
+    // The text was kept: straight to the AI.
+    expect(ids).toEqual(["claim", "reserve-quota", "analyze-0-gemini"]);
+    expect(await reload(c.id)).toMatchObject({ status: "ready", error: null, score: 82, attempts: 1 });
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+
+  it(`fails the CV on its ${MAX_AI_RETRIES}th busy run, keeping that charge`, async () => {
+    expect(MAX_AI_RETRIES).toBe(12);
+    const c = await makeCandidate();
+    await setRow(c.id, { aiRetries: MAX_AI_RETRIES - 2, error: AI_BUSY_MESSAGE });
+
+    expect(await runProcessCvSteps(c.id, "run-11", recordingSteps().step, [gemini(busyModel())])).toBe("ai-busy");
+    expect(await reload(c.id)).toMatchObject({ status: "pending", aiRetries: MAX_AI_RETRIES - 1 });
+
+    const { ids, results, step } = recordingSteps();
+    expect(await runProcessCvSteps(c.id, "run-12", step, [gemini(busyModel())])).toBe("ai-failed");
+    expect(ids.at(-1)).toBe("release-busy-ai");
+    expect(results.at(-1)?.json).toBe('"gave-up"');
+    expect(await reload(c.id)).toMatchObject({ status: "failed", error: AI_FAILED_MESSAGE, aiRetries: MAX_AI_RETRIES });
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+
+  it.each([404, 401])("fails at once when a model fails for good (HTTP %s), even if the others were busy", async (status) => {
+    const c = await makeCandidate();
+    const { ids, step } = recordingSteps();
+
+    expect(await runProcessCvSteps(c.id, RUN, step, [gemini(busyModel()), providerWith("openai", httpErrorModel(status))])).toBe(
+      "ai-failed",
+    );
+    expect(ids.at(-1)).toBe("mark-failed");
+    expect(await reload(c.id)).toMatchObject({ status: "failed", error: AI_FAILED_MESSAGE, aiRetries: 0 });
+    expect(await runProcessCvSteps((await makeCandidate()).id, RUN, recordingSteps().step, [gemini(httpErrorModel(status))])).toBe(
+      "ai-failed",
+    );
+  });
+
+  it("doesn't let a superseded run put the CV back or refund anything", async () => {
+    const c = await makeCandidate();
+    const { step } = recordingSteps(async (id) => {
+      // A re-score lands while the models are being tried.
+      if (id === "release-busy-ai") await setRow(c.id, { status: "pending", error: null, attempts: 0 });
+    });
+
+    expect(await runProcessCvSteps(c.id, RUN, step, [gemini(busyModel())])).toBe("superseded");
+    expect(await reload(c.id)).toMatchObject({ status: "pending", error: null, aiRetries: 0 });
+    // This run's charge stands, as for any superseded run; the re-score's own run is charged on its own claim.
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+});
+
+describe("releaseForBusyAi", () => {
+  it("refunds a charged claim exactly once, however often the step is retried", async () => {
+    const job = await makeJob((await makeCompany()).company.id);
+    const other = await claimedWithText({ job, text: `${CV_TEXT}\nOther` }, "run-other");
+    await reserveQuotaStep(other.id, "run-other");
+    const c = await claimedWithText({ job });
+    await reserveQuotaStep(c.id, RUN);
+    expect((await getAiQuota(job.companyId)).used).toBe(2);
+
+    expect(await releaseForBusyAi(c.id, RUN)).toBe("requeued");
+    // Inngest retries a step whose result was lost: nothing more is refunded or counted.
+    expect(await releaseForBusyAi(c.id, RUN)).toBe("superseded");
+    expect(await releaseForBusyAi(c.id, RUN)).toBe("superseded");
+
+    expect((await getAiQuota(job.companyId)).used).toBe(1);
+    expect(await reload(c.id)).toMatchObject({ status: "pending", aiRetries: 1, attempts: 0 });
+  });
+
+  it("refunds nothing for a claim that was never charged", async () => {
+    const job = await makeJob((await makeCompany()).company.id);
+    const other = await claimedWithText({ job, text: `${CV_TEXT}\nOther` }, "run-other");
+    await reserveQuotaStep(other.id, "run-other");
+    const c = await claimedWithText({ job });
+
+    expect(await releaseForBusyAi(c.id, RUN)).toBe("requeued");
+    expect((await getAiQuota(job.companyId)).used).toBe(1);
+  });
+
+  it("ignores a run whose claim was taken over, and lets the newer run release its own", async () => {
+    const c = await claimedWithText({}, "run-1");
+    await reserveQuotaStep(c.id, "run-1");
+    await claimStep(c.id, "run-2");
+    await reserveQuotaStep(c.id, "run-2");
+    expect((await getAiQuota(c.companyId)).used).toBe(2);
+
+    expect(await releaseForBusyAi(c.id, "run-1")).toBe("superseded");
+    expect(await reload(c.id)).toMatchObject({ status: "processing", claimToken: "run-2:charged", aiRetries: 0, error: null });
+    expect((await getAiQuota(c.companyId)).used).toBe(2);
+
+    expect(await releaseForBusyAi(c.id, "run-2")).toBe("requeued");
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+
+  it("leaves a finished or deleted CV alone", async () => {
+    const c = await claimedWithText();
+    await reserveQuotaStep(c.id, RUN);
+    expect(await analyzeStep(c.id, RUN, gemini())).toEqual({ ok: true });
+    expect(await releaseForBusyAi(c.id, RUN)).toBe("superseded");
+    expect(await reload(c.id)).toMatchObject({ status: "ready", error: null, aiRetries: 0 });
+
+    const gone = await claimedWithText();
+    await db.delete(candidates).where(eq(candidates.id, gone.id));
+    expect(await releaseForBusyAi(gone.id, RUN)).toBe("superseded");
+  });
+
+  it("never takes today's count below 0 (a charge made before midnight UTC, released after it)", async () => {
+    const c = await claimedWithText();
+    await reserveQuotaStep(c.id, RUN);
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    await db.insert(aiUsage).values({ companyId: c.companyId, day: utcDay(tomorrow), analyses: 0 });
+
+    expect(await releaseForBusyAi(c.id, RUN, tomorrow)).toBe("requeued");
+    expect((await getAiQuota(c.companyId, tomorrow)).used).toBe(0);
+    const [row] = await db.select().from(aiUsage).where(and(eq(aiUsage.companyId, c.companyId), eq(aiUsage.day, utcDay(tomorrow))));
+    expect(row.analyses).toBe(0);
     expect((await getAiQuota(c.companyId)).used).toBe(1);
   });
 });
@@ -344,15 +506,21 @@ describe("what Inngest stores", () => {
     expect(await runProcessCvSteps(c.id, RUN, success.step, [gemini(quoting), providerWith("openai", workingModel())])).toBe(
       "ready",
     );
-    expect(success.results.find((r) => r.id === "analyze-gemini")?.json).toBe('{"ok":false,"reason":"provider-error"}');
-    expect(success.results.find((r) => r.id === "analyze-openai")?.json).toBe('{"ok":true}');
+    expect(success.results.find((r) => r.id === "analyze-0-gemini")?.json).toBe('{"ok":false,"reason":"provider-error"}');
+    expect(success.results.find((r) => r.id === "analyze-1-openai")?.json).toBe('{"ok":true}');
 
     const failure = recordingSteps();
     expect(await runProcessCvSteps((await makeCandidate()).id, RUN, failure.step, [gemini(quoting)])).toBe("ai-failed");
 
+    // A busy provider quoting the CV in its overload message: still only a code.
+    const busy = recordingSteps();
+    const busyQuoting = httpErrorModel(503, `overloaded while reading "${CV_TEXT.split("\n")[1]}"`);
+    expect(await runProcessCvSteps((await makeCandidate()).id, RUN, busy.step, [gemini(busyQuoting)])).toBe("ai-busy");
+    expect(busy.results.find((r) => r.id === "analyze-0-gemini")?.json).toBe('{"ok":false,"reason":"transient-503"}');
+
     // The checks themselves catch personal data: the analysis as a result would fail them.
     expect(() => expectNoPersonalData([{ id: "probe", json: JSON.stringify(analysis.profile.skills) }])).toThrow();
-    expectNoPersonalData([...success.results, ...failure.results]);
+    expectNoPersonalData([...success.results, ...failure.results, ...busy.results]);
   });
 });
 
@@ -473,7 +641,7 @@ describe("analyzeStep", () => {
     expect((await reload(c.id)).status).toBe("processing");
   });
 
-  it("reports a provider's HTTP status", async () => {
+  it("reports a provider's HTTP status, and whether it is transient", async () => {
     const c = await claimedWithText();
     const limited = new MockLanguageModelV4({
       doGenerate: async () => {
@@ -487,7 +655,10 @@ describe("analyzeStep", () => {
       },
     });
 
-    expect(await analyzeStep(c.id, RUN, gemini(limited))).toEqual({ ok: false, reason: "http-429" });
+    expect(await analyzeStep(c.id, RUN, gemini(limited))).toEqual({ ok: false, reason: "transient-429" });
+    expect(await analyzeStep(c.id, RUN, gemini(busyModel()))).toEqual({ ok: false, reason: "transient-503" });
+    expect(await analyzeStep(c.id, RUN, gemini(httpErrorModel(404)))).toEqual({ ok: false, reason: "http-404" });
+    expect((await reload(c.id)).status).toBe("processing");
   });
 
   it("gives up on a provider after the step's timeout", async () => {
@@ -500,7 +671,7 @@ describe("analyzeStep", () => {
       }),
     );
 
-    expect(await analyzeStep(c.id, RUN, hanging, { timeoutMs: 50 })).toEqual({ ok: false, reason: "timeout" });
+    expect(await analyzeStep(c.id, RUN, hanging, { timeoutMs: 50 })).toEqual({ ok: false, reason: "transient-timeout" });
   });
 
   it("saves the analysis itself and returns only that it did", async () => {

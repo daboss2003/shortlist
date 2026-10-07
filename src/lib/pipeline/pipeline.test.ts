@@ -14,7 +14,8 @@ import {
   startPendingRequeue,
   waitForIdle,
 } from "./index";
-import { rejectCvTextWrites } from "./test-helpers";
+import { MAX_AI_RETRIES } from "./steps";
+import { busyModel, httpErrorModel, rejectCvTextWrites } from "./test-helpers";
 
 const ai = vi.hoisted(() => ({ model: null as unknown }));
 
@@ -193,7 +194,7 @@ describe("processCandidate", () => {
   it("records an employer-safe message when the AI fails", async () => {
     ai.model = new MockLanguageModelV4({
       doGenerate: async () => {
-        throw new Error("upstream overloaded for key sk-proj-abcdefghijklmnop");
+        throw new Error("invalid request for key sk-proj-abcdefghijklmnop");
       },
     });
     const c = await makeCandidate();
@@ -297,6 +298,108 @@ describe("daily AI quota", () => {
   });
 });
 
+describe("when every AI model is busy", () => {
+  const BUSY = "The AI service is busy — this CV will be retried automatically.";
+  const AI_FAILED = "The AI service couldn't analyze this CV right now. Try re-scoring it later.";
+
+  it("puts the CV back to pending with a note, refunds its charge and doesn't count the attempt", async () => {
+    vi.stubEnv("AI_DAILY_LIMIT", "5");
+    const busy = busyModel();
+    ai.model = busy;
+    const c = await makeCandidate();
+
+    await processCandidate(c.id);
+
+    expect(await reload(c.id)).toMatchObject({
+      status: "pending",
+      error: BUSY,
+      aiRetries: 1,
+      attempts: 0,
+      score: null,
+      cvText: CV_TEXT,
+    });
+    expect((await reload(c.id)).claimToken).not.toMatch(/:charged$/);
+    expect(await getAiQuota(c.companyId)).toMatchObject({ used: 0, remaining: 5 });
+    // The AI SDK's own quick retries ran first.
+    expect(busy.doGenerateCalls).toHaveLength(3);
+  });
+
+  it("is retried by the 5-minute re-queue, and a success clears the note", async () => {
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    const g = globalThis as unknown as { __cvPendingRequeueTimer?: ReturnType<typeof setInterval> };
+    ai.model = busyModel();
+    const c = await makeCandidate();
+    await processCandidate(c.id);
+    expect(await reload(c.id)).toMatchObject({ status: "pending", error: BUSY });
+
+    try {
+      startPendingRequeue();
+      ai.model = workingModel();
+      vi.advanceTimersByTime(5 * 60 * 1000);
+      await waitForIdle();
+    } finally {
+      clearInterval(g.__cvPendingRequeueTimer);
+      delete g.__cvPendingRequeueTimer;
+    }
+
+    expect(await reload(c.id)).toMatchObject({ status: "ready", error: null, score: 82, attempts: 1 });
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+
+  it(`fails the CV on its ${MAX_AI_RETRIES}th busy try, with the usual message`, async () => {
+    ai.model = busyModel();
+    const c = await makeCandidate();
+    await setRow(c.id, { aiRetries: MAX_AI_RETRIES - 2, error: BUSY });
+
+    await processCandidate(c.id);
+    expect(await reload(c.id)).toMatchObject({ status: "pending", error: BUSY, aiRetries: MAX_AI_RETRIES - 1 });
+
+    await processCandidate(c.id);
+    expect(await reload(c.id)).toMatchObject({ status: "failed", error: AI_FAILED, aiRetries: MAX_AI_RETRIES, attempts: 1 });
+    // That last claim stays charged, like any failed analysis.
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+
+  it.each([404, 401])("still fails at once on HTTP %s (a missing model, a bad key)", async (status) => {
+    const model = httpErrorModel(status);
+    ai.model = model;
+    const c = await makeCandidate();
+
+    await processCandidate(c.id);
+
+    expect(await reload(c.id)).toMatchObject({ status: "failed", error: AI_FAILED, aiRetries: 0, attempts: 1 });
+    expect(model.doGenerateCalls).toHaveLength(1);
+  });
+
+  it("doesn't let a superseded run put the CV back or refund anything", async () => {
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const started = new Promise<void>((r) => (firstStarted = r));
+    const busy = busyModel();
+    let calls = 0;
+    ai.model = new MockLanguageModelV4({
+      doGenerate: async (options) => {
+        if (calls++ === 0) {
+          firstStarted();
+          await new Promise<void>((r) => (releaseFirst = r));
+        }
+        return busy.doGenerate(options);
+      },
+    });
+    const c = await makeCandidate();
+
+    const run = processCandidate(c.id);
+    await started;
+    // A re-score lands while the model is being tried.
+    await setRow(c.id, { status: "pending", error: null, attempts: 0 });
+    releaseFirst();
+    await run;
+
+    expect(await reload(c.id)).toMatchObject({ status: "pending", error: null, aiRetries: 0 });
+    expect((await getAiQuota(c.companyId)).used).toBe(1);
+  });
+});
+
 describe("re-score while processing", () => {
   it("discards the superseded run and re-runs against the current job", async () => {
     let releaseFirst!: () => void;
@@ -340,7 +443,7 @@ describe("re-score while processing", () => {
       doGenerate: async () => {
         firstStarted();
         await new Promise<void>((r) => (releaseFirst = r));
-        throw new Error("upstream overloaded");
+        throw new Error("invalid request");
       },
     });
     ai.model = model;

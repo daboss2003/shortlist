@@ -1,0 +1,1 @@
+ALTER TABLE "candidates" ADD COLUMN "ai_retries" integer DEFAULT 0 NOT NULL;

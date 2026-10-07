@@ -4,7 +4,7 @@ import { after } from "next/server";
 import { db } from "@/db";
 import { aiUsage, candidates, jobs } from "@/db/schema";
 import { sendCvProcessRequested } from "@/inngest/client";
-import { AiAnalysisError, AiNotConfiguredError, analyzeCv } from "@/lib/ai/analyze";
+import { AiAnalysisError, AiNotConfiguredError, AiTemporarilyUnavailableError, analyzeCv } from "@/lib/ai/analyze";
 import { resolveProviderChain } from "@/lib/ai/providers";
 import { dailyLimit, getAiQuota, utcDay } from "@/lib/ai/quota";
 import { describeError } from "@/lib/log";
@@ -19,6 +19,7 @@ import {
   claimPending,
   markFailed,
   readCvText,
+  releaseForBusyAi,
   reserveQuotaStep,
   saveAnalysis,
   saveCvText,
@@ -174,7 +175,10 @@ function enqueueAll(rows: QueuedCandidate[]): Promise<void> {
   );
 }
 
-/** In-process mode: run the full pipeline for one candidate now. Never throws: failures are written to the row. */
+/**
+ * In-process mode: run the full pipeline for one candidate now. Never throws: failures are written to the row. When
+ * every AI model is only busy, the CV goes back to pending (see releaseForBusyAi) for the 5-minute re-queue.
+ */
 export async function processCandidate(candidateId: string): Promise<void> {
   try {
     const { chain } = resolveProviderChain();
@@ -201,6 +205,11 @@ export async function processCandidate(candidateId: string): Promise<void> {
 
       await saveAnalysis(candidate.id, token, await analyzeCv({ cvText, job }, chain));
     } catch (err) {
+      if (err instanceof AiTemporarilyUnavailableError) {
+        const released = await releaseForBusyAi(candidate.id, token);
+        console.error(`[pipeline] candidate ${candidate.id}: every AI model is busy (${released})`);
+        return;
+      }
       const known = err instanceof AiNotConfiguredError || err instanceof AiAnalysisError || err instanceof CvUnreadableError;
       console.error(`[pipeline] candidate ${candidate.id} failed:`, describeError(err, { withStack: !known }));
       await markFailed(candidate.id, token, known ? (err as Error).message : GENERIC_FAILURE_MESSAGE);

@@ -28,7 +28,7 @@ Run `npx next typegen` if `PageProps`/`LayoutProps`/`RouteContext` globals are m
 - `src/lib/candidates/intake.ts` — validate + store a CV, insert `pending` candidate (shared by public apply + employer upload).
 - `src/lib/pipeline/` — extraction + AI analysis. `scheduleCandidateProcessing` (async) sends Inngest events in
   production, falls back to `after()` on Netlify without Inngest, and uses an in-process queue locally.
-- `src/inngest/` + `src/app/api/inngest/` — CV processing (one step per provider, <60s each), requeue and retention crons.
+- `src/inngest/` + `src/app/api/inngest/` — CV processing (one step per provider *model*, <60s each), requeue and retention crons.
 - `src/lib/ai/` — `schemas.ts` (zod profile/evaluation), provider registry, prompts, `status.ts`.
 - `src/lib/cv/` — file-type sniffing, PDF/DOC/DOCX/TXT text extraction. `src/lib/storage.ts` — CV files (Netlify Blobs or local disk).
 - `src/lib/export/` — CSV/XLSX builders (the ZIP of CVs is built in the browser). `src/lib/format.ts` — all human-readable labels.
@@ -45,6 +45,9 @@ Run `npx next typegen` if `PageProps`/`LayoutProps`/`RouteContext` globals are m
 - **Pipeline claims:** every write after a CV is claimed must match `id`, `status = 'processing'` **and** its
   `claim_token`, so a superseded or failed older run can never overwrite a newer one. Anything that resets a row to
   `pending` (e.g. `markForRescore`) keeps `claim_token`/`claimed_at` — Inngest event ids are derived from them.
+- **Busy AI ≠ failure:** when every model fails transiently (429/503/timeouts; `src/lib/ai/errors.ts`), the CV goes
+  back to `pending` with a note in `error` ("Retrying" in the UI), its quota charge refunded and `ai_retries + 1`; it
+  fails only on the 12th busy try. `pending` + non-null `error` means "waiting on a busy AI".
 - **No personal data in Inngest:** step return values, step errors and event payloads are stored by Inngest Cloud
   and outlive our retention deletes — return only ids, status codes and booleans.
 - **CV extraction on serverless runs in-thread** (static import of `extract-core.mjs`). Worker threads / spawned

@@ -1,10 +1,11 @@
 import "server-only";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { aiUsage, candidates, jobs, type Candidate } from "@/db/schema";
-import { AiAnalysisError, analyzeCvWithProvider, type AnalyzeResult } from "@/lib/ai/analyze";
+import { AI_BUSY_MESSAGE, AiAnalysisError, analyzeCvWithProvider, type AnalyzeResult } from "@/lib/ai/analyze";
+import { isTransientAiFailure, type AiFailureCode } from "@/lib/ai/errors";
 import { resolveProviderChain, type ResolvedProvider } from "@/lib/ai/providers";
-import { chargeOnConflict, utcDay } from "@/lib/ai/quota";
+import { chargeOnConflict, refundUsage, utcDay } from "@/lib/ai/quota";
 import { extractCvText } from "@/lib/cv/extract-text";
 import { CV_FILE_TYPES, type CvFileType } from "@/lib/cv/file-type";
 import { describeError } from "@/lib/log";
@@ -21,6 +22,11 @@ const MIN_CV_TEXT_CHARS = 100;
 const MAX_STORED_CV_CHARS = 100_000;
 /** Claims (since the last re-score) after which a CV that was interrupted each time is failed instead of retried. */
 export const MAX_ATTEMPTS = 3;
+/**
+ * Times (since the last re-score) every AI model may be busy for a CV before it is failed instead of re-queued: about
+ * an hour of retries in-process (every 5 minutes), about 6 hours with Inngest (the 30-minute re-queue cron).
+ */
+export const MAX_AI_RETRIES = 12;
 /** One provider's budget inside one step: under Netlify's 60 s, with room for the DB reads and the save around it. */
 export const PROVIDER_STEP_TIMEOUT_MS = 45_000;
 
@@ -149,6 +155,67 @@ export async function releaseForQuota(candidateId: string, token: string): Promi
     .where(ownedBy(candidateId, token));
 }
 
+export type BusyReleaseResult = "requeued" | "gave-up" | "superseded";
+
+/**
+ * Every AI model was temporarily unavailable (overloaded, rate-limited, timing out): back to pending with a note for
+ * the employer, so the re-queue tries again later, instead of failed. The claim doesn't count as an attempt, its
+ * charge against the daily cap is given back, and `ai_retries` goes up by one. The MAX_AI_RETRIES-th time, the CV is
+ * failed with the usual AI failure message instead (and that claim stays charged, as for any failed analysis).
+ *
+ * One statement, conditional on the claim like every write after it: the row is locked, and the refund happens only
+ * when this claim was charged (`<token>:charged`) and the row was actually released. The release also drops the charge
+ * marker (same claim generation, so the next event id is unchanged). A retry of this step, or a run that lost its
+ * claim, finds the row no longer processing under `token` and gives back nothing, so a refund can't happen twice.
+ */
+export async function releaseForBusyAi(candidateId: string, token: string, now: Date = new Date()): Promise<BusyReleaseResult> {
+  const owned = db.$with("owned").as(
+    db
+      .select({ companyId: candidates.companyId, claimToken: candidates.claimToken })
+      .from(candidates)
+      .where(ownedBy(candidateId, token))
+      .for("update"),
+  );
+  const released = db.$with("released").as(
+    db
+      .update(candidates)
+      .set({
+        status: "pending",
+        error: AI_BUSY_MESSAGE,
+        attempts: sql`${candidates.attempts} - 1`,
+        aiRetries: sql`${candidates.aiRetries} + 1`,
+        claimToken: token,
+      })
+      // Intentional: `exists (owned)` looks redundant next to ownedBy, but it makes the lock (and the read of the old
+      // claim token) happen before this update. A row this statement had already updated would be skipped by
+      // owned's FOR UPDATE, and the CV would be released with no refund.
+      .where(
+        and(ownedBy(candidateId, token), lt(candidates.aiRetries, MAX_AI_RETRIES - 1), sql`exists (select 1 from ${owned})`),
+      )
+      .returning({ id: candidates.id }),
+  );
+  const refunded = db.$with("refunded").as(
+    refundUsage(
+      sql`(select ${owned.companyId} from ${owned} where ${owned.claimToken} = ${chargedForm(token)} and exists (select 1 from ${released}))`,
+      now,
+    ),
+  );
+  const [row] = await db
+    .with(owned, released, refunded)
+    .select({ released: sql<boolean>`exists (select 1 from ${released})` })
+    .from(owned);
+  if (!row) return "superseded";
+  if (row.released) return "requeued";
+
+  // Still claimed, but this was the last busy retry allowed.
+  const failed = await db
+    .update(candidates)
+    .set({ status: "failed", error: new AiAnalysisError().message, aiRetries: sql`${candidates.aiRetries} + 1` })
+    .where(ownedBy(candidateId, token))
+    .returning({ id: candidates.id });
+  return failed.length > 0 ? "gave-up" : "superseded";
+}
+
 /** Stores the analysis and marks the candidate ready. False when the claim was lost (nothing written). */
 export async function saveAnalysis(
   candidateId: string,
@@ -244,16 +311,17 @@ export async function reserveQuotaStep(candidateId: string, token: string): Prom
 }
 
 /**
- * Why one provider's step didn't save an analysis: a short code, never the provider's message (which can quote the
- * prompt, and so the CV). "superseded": the claim was lost, so the run stops.
+ * Why one model's step didn't save an analysis: a short code (see src/lib/ai/errors.ts), never the provider's message
+ * (which can quote the prompt, and so the CV). "transient-…" codes mean the model was busy or out of reach.
+ * "superseded": the claim was lost, so the run stops.
  */
-export type AnalyzeFailure = "superseded" | "timeout" | "invalid-output" | `http-${number}` | "provider-error";
+export type AnalyzeFailure = "superseded" | AiFailureCode;
 export type AnalyzeStepResult = { ok: true } | { ok: false; reason: AnalyzeFailure };
 
 /**
- * One provider of the fallback chain: calls the AI and saves its analysis in the same step, so the analysis never
- * becomes a step result. A provider failure is returned, not thrown, so the run moves on to the next provider
- * instead of Inngest retrying this one.
+ * One model of the fallback chain: calls the AI and saves its analysis in the same step, so the analysis never
+ * becomes a step result. A failure is returned, not thrown, so the run moves on to the next model instead of Inngest
+ * retrying this one.
  */
 export async function analyzeStep(
   candidateId: string,
@@ -272,16 +340,9 @@ export async function analyzeStep(
   if (row.cvText == null) throw new Error(`Candidate ${candidateId} has no extracted text to analyze`);
 
   const attempt = await analyzeCvWithProvider({ cvText: row.cvText, job: row.job }, provider, { timeoutMs });
-  if (!attempt.ok) return { ok: false, reason: failureCode(attempt.reason) };
+  // The reason (with the provider's message) has been logged; only its code may become the step result.
+  if (!attempt.ok) return { ok: false, reason: attempt.code };
   return (await saveAnalysis(candidateId, token, attempt.result)) ? { ok: true } : { ok: false, reason: "superseded" };
-}
-
-/** Maps analyzeCvWithProvider's reason (already logged in full) to a code. Its formats are set in src/lib/ai/analyze.ts. */
-function failureCode(reason: string): AnalyzeFailure {
-  if (reason.startsWith("timed out")) return "timeout";
-  if (reason.startsWith("the response didn't match")) return "invalid-output";
-  const status = /^HTTP (\d{3})\b/.exec(reason)?.[1];
-  return status ? `http-${Number(status)}` : "provider-error";
 }
 
 /** What runs one durable step. Inngest's `step` in production; tests pass `{ run: (id, fn) => fn() }`. */
@@ -295,11 +356,13 @@ export type ProcessCvOutcome =
   | "quota-reached"
   | "superseded"
   | "ready"
+  | "ai-busy"
   | "ai-failed";
 
 /**
- * The Inngest process-cv run for one candidate: one step per unit of work, one step per provider. `token` is the
- * run's id: its claim token, which the run's onFailure handler also knows.
+ * The Inngest process-cv run for one candidate: one step per unit of work, one step per model of the chain. `token` is
+ * the run's id: its claim token, which the run's onFailure handler also knows. When every model was only busy, one
+ * last step puts the CV back to pending (see releaseForBusyAi) and the run ends; the re-queue cron sends it again.
  */
 export async function runProcessCvSteps(
   candidateId: string,
@@ -322,10 +385,18 @@ export async function runProcessCvSteps(
   const quota = await step.run("reserve-quota", () => reserveQuotaStep(candidateId, token));
   if (quota !== "reserved") return quota;
 
-  for (const provider of chain) {
-    const attempt = await step.run(`analyze-${provider.id}`, () => analyzeStep(candidateId, token, provider));
+  let allTransient = true;
+  for (const [index, provider] of chain.entries()) {
+    // The index keeps step ids unique: a provider can appear once per model.
+    const attempt = await step.run(`analyze-${index}-${provider.id}`, () => analyzeStep(candidateId, token, provider));
     if (attempt.ok) return "ready";
     if (attempt.reason === "superseded") return "superseded";
+    if (!isTransientAiFailure(attempt.reason)) allTransient = false;
+  }
+
+  if (allTransient) {
+    const released = await step.run("release-busy-ai", () => releaseForBusyAi(candidateId, token));
+    return released === "requeued" ? "ai-busy" : released === "gave-up" ? "ai-failed" : "superseded";
   }
 
   const failed = await step.run("mark-failed", () => markFailed(candidateId, token, new AiAnalysisError().message));
