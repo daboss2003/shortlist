@@ -18,7 +18,7 @@ const nextConfig: NextConfig = {
   cacheComponents: true,
   partialPrefetching: true,
   // Native/Node-only libraries used by the CV pipeline and exports must not be bundled.
-  serverExternalPackages: ["better-sqlite3", "unpdf", "mammoth", "exceljs", "jszip"],
+  serverExternalPackages: ["@electric-sql/pglite", "unpdf", "mammoth", "exceljs", "jszip", "word-extractor"],
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },
