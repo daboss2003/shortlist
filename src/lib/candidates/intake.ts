@@ -86,7 +86,6 @@ function isUniqueViolation(err: unknown): boolean {
 /** Keep the original name for display/download only: strip paths and control chars, cap length. */
 function sanitizeFileName(name: string): string {
   const base = name.split(/[\\/]/).pop() ?? "cv";
-  // eslint-disable-next-line no-control-regex
   const clean = base.replace(/[\u0000-\u001f\u007f"]/g, "").trim();
   return (clean || "cv").slice(0, 200);
 }
