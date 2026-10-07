@@ -1,7 +1,9 @@
+import fs from "node:fs";
 import { eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { db } from "@/db";
 import { candidates } from "@/db/schema";
+import { MAX_CV_BYTES } from "@/lib/cv/file-type";
 import { resetRateLimits } from "@/lib/rate-limit";
 import { makeCompany, makeJob } from "../../../../../test/factories";
 import { POST } from "./route";
@@ -39,7 +41,35 @@ function apply(slug: string, body: FormData, init: { ip?: string; headers?: Reco
   return POST(request, { params: Promise.resolve({ slug }) });
 }
 
+/**
+ * Sends the body as a stream of chunks with no Content-Length, like a chunked upload, and reports how many
+ * bytes the route pulled from it.
+ */
+async function applyStreamed(slug: string, body: FormData, chunkSize = 64 * 1024) {
+  const encoded = new Response(body);
+  const bytes = new Uint8Array(await encoded.arrayBuffer());
+  let pulled = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (pulled >= bytes.length) return controller.close();
+      controller.enqueue(bytes.slice(pulled, pulled + chunkSize));
+      pulled = Math.min(pulled + chunkSize, bytes.length);
+    },
+  });
+  const request = new Request(`http://localhost/api/apply/${slug}`, {
+    method: "POST",
+    body: stream,
+    headers: { "content-type": encoded.headers.get("content-type")!, "x-forwarded-for": "198.51.100.1" },
+    duplex: "half",
+  } as RequestInit);
+  expect(request.headers.get("content-length")).toBeNull();
+  const res = await POST(request, { params: Promise.resolve({ slug }) });
+  return { res, bytesRead: pulled, totalBytes: bytes.length };
+}
+
 const rowsFor = (jobId: string) => db.select().from(candidates).where(eq(candidates.jobId, jobId)).all();
+const storedFiles = () => fs.readdirSync(process.env.UPLOAD_DIR!).sort();
+const CV_TOO_LARGE = "Your CV is larger than 5 MB. Please upload a smaller file.";
 
 function openJob() {
   const { company } = makeCompany();
@@ -119,7 +149,47 @@ describe("POST /api/apply/[slug]", () => {
     const res = await apply(job.slug, formData(), { headers: { "content-length": String(50 * 1024 * 1024) } });
 
     expect(res.status).toBe(400);
-    expect((await res.json()).fieldErrors.cv).toMatch(/larger than 5 MB/);
+    expect((await res.json()).fieldErrors.cv).toBe(CV_TOO_LARGE);
+  });
+
+  it("201: accepts a valid application streamed in chunks with no Content-Length", async () => {
+    const job = openJob();
+    const { res } = await applyStreamed(job.slug, formData());
+
+    expect(res.status).toBe(201);
+    expect(rowsFor(job.id)).toHaveLength(1);
+  });
+
+  it("400: rejects an over-cap chunked body with no Content-Length, stops reading early and stores nothing", async () => {
+    const job = openJob();
+    const filesBefore = storedFiles();
+    // Otherwise valid: without a streaming cap this would be accepted and the padding buffered in memory.
+    const body = formData();
+    body.set("notes", new File([new Uint8Array(16 * 1024 * 1024)], "padding.bin"));
+
+    const { res, bytesRead, totalBytes } = await applyStreamed(job.slug, body);
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ fieldErrors: { cv: CV_TOO_LARGE } });
+    expect(totalBytes).toBeGreaterThan(16 * 1024 * 1024);
+    expect(bytesRead).toBeLessThan(MAX_CV_BYTES + 2 * 1024 * 1024);
+    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(storedFiles()).toEqual(filesBefore);
+    expect(scheduleSpy).not.toHaveBeenCalled();
+  });
+
+  it("400: a CV over 5 MB that fits inside the body headroom is still rejected, with the same message", async () => {
+    const job = openJob();
+    const filesBefore = storedFiles();
+    const bigPdf = new Uint8Array(MAX_CV_BYTES + 512 * 1024);
+    bigPdf.set(pdfBytes);
+
+    const res = await apply(job.slug, formData({ cv: pdfFile(bigPdf) }));
+
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ fieldErrors: { cv: CV_TOO_LARGE } });
+    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(storedFiles()).toEqual(filesBefore);
   });
 
   it("404: unknown slug", async () => {

@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { Suspense, cache, type ReactNode } from "react";
-import { Award, Briefcase, Building2, Calendar, CircleSlash, ExternalLink, MapPin, type LucideIcon } from "lucide-react";
+import { Award, Briefcase, Building2, Calendar, ExternalLink, MapPin, type LucideIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { buttonClass } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -9,6 +9,7 @@ import { cn } from "@/lib/cn";
 import { getPublicJobBySlug, type PublicJob } from "@/lib/data/jobs";
 import { EMPLOYMENT_TYPE_LABELS, formatDate } from "@/lib/format";
 import { ApplicationForm } from "./_components/application-form";
+import { ClosedNotice } from "./_components/closed-notice";
 import { PoweredByFooter } from "./_components/powered-by-footer";
 
 const container = "mx-auto w-full max-w-5xl px-4 sm:px-6 lg:px-8";
@@ -126,17 +127,14 @@ async function ApplyContent({ params }: Pick<PageProps<"/apply/[slug]">, "params
             )}
           >
             {isOpen ? (
-              <ApplicationForm slug={job.slug} companyName={job.companyName} jobTitle={job.title} />
+              <ApplicationForm
+                slug={job.slug}
+                companyName={job.companyName}
+                jobTitle={job.title}
+                retentionDays={job.companyRetentionDays}
+              />
             ) : (
-              <div className="flex flex-col items-center px-6 py-10 text-center">
-                <span className="flex size-12 items-center justify-center rounded-full bg-subtle text-ink-muted">
-                  <CircleSlash className="size-6" aria-hidden />
-                </span>
-                <h2 className="mt-4 text-base font-semibold text-ink">
-                  This role is no longer accepting applications.
-                </h2>
-                <p className="mt-1 text-sm text-ink-muted">Thanks for your interest in {job.companyName}.</p>
-              </div>
+              <ClosedNotice companyName={job.companyName} />
             )}
           </Card>
         </div>

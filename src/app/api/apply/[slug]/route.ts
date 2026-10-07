@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { BodyTooLargeError, readFormDataWithLimit } from "@/lib/body-limit";
 import {
   CvValidationError,
   DuplicateApplicationError,
@@ -17,7 +18,7 @@ type FieldErrors = Partial<Record<ApplyField, string>>;
 
 const MAX_MB = MAX_CV_BYTES / (1024 * 1024);
 // Headroom for the text fields and multipart boundaries on top of the CV itself.
-const MAX_BODY_BYTES = MAX_CV_BYTES + 256 * 1024;
+const MAX_BODY_BYTES = MAX_CV_BYTES + 1024 * 1024;
 const PHONE_PATTERN = /^[0-9 +\-().]*$/;
 
 const MESSAGES = {
@@ -79,14 +80,12 @@ export async function POST(request: Request, ctx: RouteContext<"/api/apply/[slug
     if (!job) return jsonError(404, "This job link is invalid.");
     if (job.status !== "open") return jsonError(410, "This role is no longer accepting applications.");
 
-    // Reject oversized bodies before buffering them into memory.
-    const declaredLength = Number(request.headers.get("content-length"));
-    if (declaredLength > MAX_BODY_BYTES) return fieldErrorResponse({ cv: MESSAGES.cvTooLarge });
-
+    // Stops reading as soon as the cap is passed, so chunked bodies without a Content-Length are bounded too.
     let form: FormData;
     try {
-      form = await request.formData();
-    } catch {
+      form = await readFormDataWithLimit(request, MAX_BODY_BYTES);
+    } catch (err) {
+      if (err instanceof BodyTooLargeError) return fieldErrorResponse({ cv: MESSAGES.cvTooLarge });
       return jsonError(400, "We couldn't read your application. Please try again.");
     }
 
@@ -114,11 +113,16 @@ export async function POST(request: Request, ctx: RouteContext<"/api/apply/[slug
     const cvEntry = form.get("cv");
     let cv: Awaited<ReturnType<typeof validateCvUpload>> | null = null;
     if (!fieldErrors.cv && cvEntry instanceof File) {
-      try {
-        cv = await validateCvUpload(cvEntry);
-      } catch (err) {
-        if (!(err instanceof CvValidationError)) throw err;
-        fieldErrors.cv = err.message;
+      // Same wording whether the body cap or the file cap catches an oversized CV.
+      if (cvEntry.size > MAX_CV_BYTES) {
+        fieldErrors.cv = MESSAGES.cvTooLarge;
+      } else {
+        try {
+          cv = await validateCvUpload(cvEntry);
+        } catch (err) {
+          if (!(err instanceof CvValidationError)) throw err;
+          fieldErrors.cv = err.message;
+        }
       }
     }
 

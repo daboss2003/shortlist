@@ -7,8 +7,9 @@ import { CardHeader } from "@/components/ui/card";
 import { Alert, Spinner } from "@/components/ui/feedback";
 import { Field, Input, Label } from "@/components/ui/field";
 import { cn } from "@/lib/cn";
-import { CV_ACCEPT, MAX_CV_BYTES } from "@/lib/cv/file-type";
+import { CV_ACCEPT, CV_FILE_TYPES, MAX_CV_BYTES } from "@/lib/cv/file-type";
 import { formatBytes } from "@/lib/format";
+import { ClosedNotice } from "./closed-notice";
 
 type FieldName = "name" | "email" | "phone" | "cv" | "consent";
 type FieldErrors = Partial<Record<FieldName, string>>;
@@ -17,10 +18,11 @@ type ApplyResponse = { ok?: boolean; error?: string; fieldErrors?: FieldErrors }
 const FIELD_ORDER: FieldName[] = ["name", "email", "phone", "cv", "consent"];
 const fieldId = (field: FieldName) => `apply-${field}`;
 const SUCCESS_HEADING_ID = "apply-success-title";
+const CLOSED_HEADING_ID = "apply-closed-title";
 const REMOVE_CV_ID = "apply-cv-remove";
 
 const MAX_MB = MAX_CV_BYTES / (1024 * 1024);
-const CV_EXTENSIONS = ["pdf", "docx", "txt"];
+const CV_EXTENSIONS: readonly string[] = CV_FILE_TYPES;
 // Server (zod) is authoritative; these only catch the obvious before uploading a whole CV.
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PHONE_PATTERN = /^[0-9 +\-().]*$/;
@@ -33,8 +35,7 @@ const phoneSafeText = "max-sm:text-base";
 
 function checkCvFile(file: File): string | null {
   const ext = file.name.includes(".") ? (file.name.toLowerCase().split(".").pop() ?? "") : "";
-  if (ext === "doc") return "Older Word (.doc) files aren't supported. Please save your CV as .docx or PDF.";
-  if (!CV_EXTENSIONS.includes(ext)) return "That file type isn't supported. Please upload a PDF, Word (.docx) or TXT file.";
+  if (!CV_EXTENSIONS.includes(ext)) return "That file type isn't supported. Please upload a PDF, Word (.doc or .docx) or TXT file.";
   if (file.size === 0) return "That file is empty. Please choose another one.";
   if (file.size > MAX_CV_BYTES) {
     return `That file is ${formatBytes(file.size)}. Please upload a CV of ${MAX_MB} MB or less.`;
@@ -67,10 +68,13 @@ export function ApplicationForm({
   slug,
   companyName,
   jobTitle,
+  retentionDays,
 }: {
   slug: string;
   companyName: string;
   jobTitle: string;
+  /** Days after the role closes before applicant data is deleted; null when the company keeps it. */
+  retentionDays: number | null;
 }) {
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -78,6 +82,8 @@ export function ApplicationForm({
   const [formError, setFormError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [submitted, setSubmitted] = useState<{ firstName: string; email: string } | null>(null);
+  // The page was loaded while the role was open, but it closed before this applicant submitted.
+  const [closed, setClosed] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Element id to focus after the next render (the target may only exist once state has applied).
   const focusAfterRender = useRef<string | null>(null);
@@ -177,6 +183,11 @@ export function ApplicationForm({
       focusAfterRender.current = SUCCESS_HEADING_ID;
       return;
     }
+    if (response.status === 410) {
+      setClosed(true);
+      focusAfterRender.current = CLOSED_HEADING_ID;
+      return;
+    }
     if (body.fieldErrors && Object.keys(body.fieldErrors).length > 0) {
       // The server rejected this file's contents; clear it so the dropzone is ready for another.
       if (body.fieldErrors.cv) setFile(null);
@@ -190,7 +201,18 @@ export function ApplicationForm({
   const describedBy = (field: FieldName, hint?: boolean) =>
     fieldErrors[field] ? `${fieldId(field)}-error` : hint ? `${fieldId(field)}-hint` : undefined;
 
-  const liveMessage = pending ? "Submitting your application…" : submitted ? "Application received." : "";
+  const liveMessage = pending
+    ? "Submitting your application…"
+    : submitted
+      ? "Application received."
+      : closed
+        ? "This role is no longer accepting applications."
+        : "";
+
+  const privacyNote =
+    retentionDays == null
+      ? `Your CV is shared only with ${companyName} for this role.`
+      : `Your CV is shared only with ${companyName} for this role and is deleted ${retentionDays} day${retentionDays === 1 ? "" : "s"} after the role closes.`;
 
   return (
     <>
@@ -212,6 +234,8 @@ export function ApplicationForm({
           </p>
           <p className="mt-3 text-sm text-ink-faint">You can close this page.</p>
         </div>
+      ) : closed ? (
+        <ClosedNotice companyName={companyName} headingId={CLOSED_HEADING_ID} />
       ) : (
         <>
           <CardHeader title="Apply for this role" />
@@ -348,7 +372,7 @@ export function ApplicationForm({
                     <span className="font-medium text-brand-ink">Choose a file</span> or drag it here
                   </span>
                   <span id={`${fieldId("cv")}-hint`} className="text-xs text-ink-muted">
-                    PDF, Word (.docx) or TXT · up to {MAX_MB} MB
+                    PDF, Word (.doc, .docx) or TXT · up to {MAX_MB} MB
                   </span>
                 </div>
               )}
@@ -412,10 +436,7 @@ export function ApplicationForm({
               </Button>
               <p className="flex items-start gap-2 text-sm text-ink-muted">
                 <Lock className="mt-0.5 size-4 shrink-0" aria-hidden />
-                <span>
-                  Your CV is shared only with {companyName} for this role. Applications may be screened with the help
-                  of AI.
-                </span>
+                <span>{privacyNote} Applications may be screened with the help of AI.</span>
               </p>
             </div>
           </form>
