@@ -1,13 +1,24 @@
 import "server-only";
 
-type Task = { done: Promise<void>; resolve: () => void };
+type Deferred = { done: Promise<void>; resolve: () => void };
+type Task = Deferred & { running: boolean; rerun: Deferred | null };
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const done = new Promise<void>((r) => (resolve = r));
+  return { done, resolve };
+}
 
 /**
- * In-process FIFO work queue keyed by id. An id that is already waiting or running isn't added twice;
- * callers get the same completion promise. Completion promises always resolve, never reject.
+ * In-process work queue keyed by id and shared fairly between groups (companies): each group has its own FIFO
+ * list and the groups take turns, so one company's bulk upload can't hold up another's CVs.
+ * An id that is already waiting isn't added twice; callers get the same completion promise. An id enqueued
+ * while it is running runs once more straight after, so that run sees whatever changed in the meantime.
+ * Completion promises always resolve, never reject.
  */
 export class TaskQueue {
-  private readonly waiting: string[] = [];
+  /** Groups with waiting ids. Map order is turn order: a group that just had its turn moves to the back. */
+  private readonly waiting = new Map<string, string[]>();
   private readonly tasks = new Map<string, Task>();
   private readonly idleWaiters: Array<() => void> = [];
   private running = 0;
@@ -18,16 +29,21 @@ export class TaskQueue {
     private readonly concurrency: () => number,
   ) {}
 
-  enqueue(id: string): Promise<void> {
+  enqueue(id: string, group: string): Promise<void> {
     const existing = this.tasks.get(id);
-    if (existing) return existing.done;
+    if (existing && !existing.running) return existing.done;
+    if (existing) {
+      existing.rerun ??= deferred();
+      return existing.rerun.done;
+    }
 
-    let resolve!: () => void;
-    const done = new Promise<void>((r) => (resolve = r));
-    this.tasks.set(id, { done, resolve });
-    this.waiting.push(id);
+    const task: Task = { ...deferred(), running: false, rerun: null };
+    this.tasks.set(id, task);
+    const ids = this.waiting.get(group);
+    if (ids) ids.push(id);
+    else this.waiting.set(group, [id]);
     this.pump();
-    return done;
+    return task.done;
   }
 
   /** Resolves once nothing is waiting or running. */
@@ -37,13 +53,24 @@ export class TaskQueue {
   }
 
   private isIdle(): boolean {
-    return this.running === 0 && this.waiting.length === 0;
+    return this.running === 0 && this.waiting.size === 0;
+  }
+
+  private takeNext(): string | undefined {
+    const first = this.waiting.entries().next();
+    if (first.done) return undefined;
+    const [group, ids] = first.value;
+    const id = ids.shift();
+    this.waiting.delete(group);
+    if (ids.length > 0) this.waiting.set(group, ids);
+    return id;
   }
 
   private pump(): void {
     const limit = Math.max(1, Math.floor(this.concurrency()));
-    while (this.running < limit && this.waiting.length > 0) {
-      const id = this.waiting.shift()!;
+    while (this.running < limit) {
+      const id = this.takeNext();
+      if (id === undefined) break;
       this.running++;
       void this.run(id);
     }
@@ -51,15 +78,22 @@ export class TaskQueue {
   }
 
   private async run(id: string): Promise<void> {
-    try {
-      await this.worker(id);
-    } catch (err) {
-      console.error(`[pipeline] worker crashed for ${id}:`, err instanceof Error ? err.message : err);
-    } finally {
-      this.running--;
-      this.tasks.get(id)?.resolve();
-      this.tasks.delete(id);
-      this.pump();
+    const task = this.tasks.get(id)!;
+    task.running = true;
+    for (;;) {
+      try {
+        await this.worker(id);
+      } catch (err) {
+        console.error(`[pipeline] worker crashed for ${id}:`, err instanceof Error ? err.message : err);
+      }
+      if (!task.rerun) break;
+      // Enqueued again while running: settle this run's callers, then go again in the same slot.
+      task.resolve();
+      Object.assign(task, task.rerun, { rerun: null });
     }
+    this.running--;
+    this.tasks.delete(id);
+    task.resolve();
+    this.pump();
   }
 }

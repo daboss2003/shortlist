@@ -1,35 +1,44 @@
 import "server-only";
 import { APICallError, NoObjectGeneratedError, Output, RetryError, generateText } from "ai";
 import type { Job } from "@/db/schema";
-import { buildAnalysisPrompt } from "@/lib/ai/prompt";
+import { RECOMMENDATION_MIN_SCORES, buildAnalysisPrompt } from "@/lib/ai/prompt";
 import { resolveProviderChain, type ResolvedProvider } from "@/lib/ai/providers";
-import { cvAnalysisSchema, type CvAnalysis } from "@/lib/ai/schemas";
+import { cvAnalysisSchema, type CvAnalysis, type Recommendation } from "@/lib/ai/schemas";
 import type { AiProviderId } from "@/lib/ai/status";
 
+// Both messages are shown to employers: no env var names, no provider errors (those go to the server log).
+const NOT_CONFIGURED_MESSAGE = "AI ranking isn't set up yet.";
+const ANALYSIS_FAILED_MESSAGE = "The AI service couldn't analyze this CV right now. Try re-scoring it later.";
+
 /** No provider key in env. Message is safe to show to the employer. */
-export class AiNotConfiguredError extends Error {}
+export class AiNotConfiguredError extends Error {
+  constructor() {
+    super(NOT_CONFIGURED_MESSAGE);
+  }
+}
 
 /** Every configured provider failed. Message is short and safe to show to the employer. */
-export class AiAnalysisError extends Error {}
+export class AiAnalysisError extends Error {
+  constructor() {
+    super(ANALYSIS_FAILED_MESSAGE);
+  }
+}
 
 export type AnalyzeResult = { analysis: CvAnalysis; provider: AiProviderId; modelId: string };
 
 const TIMEOUT_MS = 120_000;
 const MAX_LISTED = 5;
+/** Longer model-supplied emails or links are dropped, which also bounds the regex work on them. */
+const MAX_CHECKED_CHARS = 500;
 
 /** Extracts a profile and scores the CV against the job, trying each provider in order. */
 export async function analyzeCv(
   input: { cvText: string; job: Job },
   chain: ResolvedProvider[] = resolveProviderChain().chain,
 ): Promise<AnalyzeResult> {
-  if (chain.length === 0) {
-    throw new AiNotConfiguredError(
-      "No AI provider is configured. Add GEMINI_API_KEY (or another provider key) to the environment.",
-    );
-  }
+  if (chain.length === 0) throw new AiNotConfiguredError();
 
   const { system, prompt } = buildAnalysisPrompt(input);
-  const failures: string[] = [];
 
   for (const provider of chain) {
     try {
@@ -44,12 +53,13 @@ export async function analyzeCv(
       });
       return { analysis: sanitizeAnalysis(result.output), provider: provider.id, modelId: provider.modelId };
     } catch (err) {
-      console.error(`[ai] ${provider.id} (${provider.modelId}) failed: ${clip(redact(errorMessage(err)), 500)}`);
-      failures.push(`${provider.label}: ${clip(redact(shortReason(err)), 120)}`);
+      console.error(
+        `[ai] ${provider.id} (${provider.modelId}) failed: ${clip(redact(shortReason(err)), 200)} | ${clip(redact(errorMessage(err)), 500)}`,
+      );
     }
   }
 
-  throw new AiAnalysisError(clip(`AI analysis failed (${failures.join("; ")})`, 300));
+  throw new AiAnalysisError();
 }
 
 function errorMessage(err: unknown): string {
@@ -81,6 +91,7 @@ function clip(text: string, max: number): string {
 function sanitizeAnalysis({ profile, evaluation }: CvAnalysis): CvAnalysis {
   const matchedSkills = cleanList(evaluation.matchedSkills);
   const matched = new Set(matchedSkills.map((s) => s.toLowerCase()));
+  const overallScore = clampScore(evaluation.overallScore);
 
   return {
     profile: {
@@ -113,7 +124,7 @@ function sanitizeAnalysis({ profile, evaluation }: CvAnalysis): CvAnalysis {
       links: cleanList(profile.links.map(normalizeLink).filter((l): l is string => l !== null)),
     },
     evaluation: {
-      overallScore: clampScore(evaluation.overallScore),
+      overallScore,
       skillsScore: clampScore(evaluation.skillsScore),
       experienceScore: clampScore(evaluation.experienceScore),
       educationScore: clampScore(evaluation.educationScore),
@@ -123,9 +134,17 @@ function sanitizeAnalysis({ profile, evaluation }: CvAnalysis): CvAnalysis {
       strengths: cleanList(evaluation.strengths).slice(0, MAX_LISTED),
       concerns: cleanList(evaluation.concerns).slice(0, MAX_LISTED),
       summary: evaluation.summary.trim(),
-      recommendation: evaluation.recommendation,
+      // Intentional: the model's own recommendation is ignored, so an injected CV can't show "Strong fit" next to a 12.
+      recommendation: recommendationFor(overallScore),
     },
   };
+}
+
+function recommendationFor(overallScore: number): Recommendation {
+  if (overallScore >= RECOMMENDATION_MIN_SCORES.strong_fit) return "strong_fit";
+  if (overallScore >= RECOMMENDATION_MIN_SCORES.good_fit) return "good_fit";
+  if (overallScore >= RECOMMENDATION_MIN_SCORES.possible_fit) return "possible_fit";
+  return "not_a_fit";
 }
 
 function clampScore(n: number): number {
@@ -153,13 +172,13 @@ function cleanList(values: string[]): string[] {
 
 function cleanEmail(value: string | null): string | null {
   const v = value?.trim().toLowerCase();
-  return v && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : null;
+  return v && v.length <= MAX_CHECKED_CHARS && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v) ? v : null;
 }
 
 /** http(s) URLs only; bare domains get https://. Drops javascript:, data:, mailto:, credentials and hostless junk. */
 function normalizeLink(raw: string): string | null {
   const value = raw.trim();
-  if (!value) return null;
+  if (!value || value.length > MAX_CHECKED_CHARS) return null;
   // A scheme is "word:" not followed by a digit, so "github.com:443/x" still counts as a bare domain.
   const hasScheme = /^[a-z][a-z\d+.-]*:(?!\d)/i.test(value);
   let url: URL;
