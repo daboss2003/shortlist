@@ -10,7 +10,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "invite": "node scripts/invite.mjs"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "^4.0.74",
@@ -29,6 +30,7 @@
     "react-dom": "19.3.0",
     "server-only": "^0.0.1",
     "unpdf": "^1.8.1",
+    "word-extractor": "^1.0.4",
     "zod": "^4.6.5"
   },
   "devDependencies": {
