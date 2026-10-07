@@ -42,6 +42,14 @@ Run `npx next typegen` if `PageProps`/`LayoutProps`/`RouteContext` globals are m
 - **All DB access is async.** Use `.returning()` to learn what changed; never driver-specific result fields
   (`rowCount`, `changes`). Type-aware ESLint (`no-misused-promises`, `no-floating-promises`) must stay clean — an
   un-awaited query in a condition silently bypasses tenant checks.
+- **Pipeline claims:** every write after a CV is claimed must match `id`, `status = 'processing'` **and** its
+  `claim_token`, so a superseded or failed older run can never overwrite a newer one. Anything that resets a row to
+  `pending` (e.g. `markForRescore`) keeps `claim_token`/`claimed_at` — Inngest event ids are derived from them.
+- **No personal data in Inngest:** step return values, step errors and event payloads are stored by Inngest Cloud
+  and outlive our retention deletes — return only ids, status codes and booleans.
+- **CV extraction on serverless runs in-thread** (static import of `extract-core.mjs`). Worker threads / spawned
+  scripts aren't reliably bundled by Turbopack for Netlify — verified: a worker entry shipped as an unbundled asset
+  and every CV failed.
 - **Tenancy:** every employer query filters by `companyId` from `requireEmployer()` / `getCurrentEmployer()`, never from input.
   `candidates.company_id` is denormalized for this. A foreign id must behave exactly like a missing one (404 / notFound()).
 - **Auth:** pages + Server Actions call `requireEmployer()`; Route Handlers call `getCurrentEmployer()` and return 401 JSON.
