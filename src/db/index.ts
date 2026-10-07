@@ -6,24 +6,37 @@ import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3"
 import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import * as schema from "./schema";
 
-export type Db = BetterSQLite3Database<typeof schema>;
+export type Db = BetterSQLite3Database<typeof schema> & { $client: Database.Database };
 
 function createDb(): Db {
-  const file = process.env.DATABASE_PATH ?? path.join(process.cwd(), "data", "app.db");
+  const file = process.env.DATABASE_PATH ?? path.join(/*turbopackIgnore: true*/ process.cwd(), "data", "app.db");
   if (file !== ":memory:") fs.mkdirSync(path.dirname(file), { recursive: true });
 
   const sqlite = new Database(file);
   sqlite.pragma("journal_mode = WAL");
   sqlite.pragma("foreign_keys = ON");
   sqlite.pragma("busy_timeout = 5000");
+  // Deleted CVs/profiles are overwritten on disk, not just unlinked — retention deletes must really erase.
+  sqlite.pragma("secure_delete = ON");
 
   const db = drizzle(sqlite, { schema });
-  // Idempotent; runs on first import so dev, `next start` and tests all get an up-to-date schema.
-  migrate(db, { migrationsFolder: path.join(process.cwd(), "drizzle") });
+  migrate(db, { migrationsFolder: path.join(/*turbopackIgnore: true*/ process.cwd(), "drizzle") });
   return db;
 }
 
-// Intentional: cache on globalThis so Next dev hot-reloads don't open a new SQLite handle per edit.
+// Intentional: cached on globalThis so dev hot reloads and the several module copies Next creates per
+// server bundle share one SQLite handle, and migrations run once per process.
 const globalForDb = globalThis as unknown as { __cvDb?: Db };
-export const db: Db = globalForDb.__cvDb ?? createDb();
-if (process.env.NODE_ENV !== "production") globalForDb.__cvDb = db;
+const getDb = (): Db => (globalForDb.__cvDb ??= createDb());
+
+/**
+ * Lazy handle: the database is opened (and migrated) on first use at runtime, never merely by importing
+ * this module — `next build` imports every route and must not create or migrate the live database.
+ */
+export const db: Db = new Proxy({} as Db, {
+  get(_target, prop) {
+    const instance = getDb();
+    const value = Reflect.get(instance, prop, instance);
+    return typeof value === "function" ? value.bind(instance) : value;
+  },
+});

@@ -1,30 +1,44 @@
 import "server-only";
-import { and, asc, eq, inArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, eq, getTableColumns, sql, type SQL } from "drizzle-orm";
 import { db } from "@/db";
 import { candidates, jobs, type Candidate, type CandidateStage, type Job } from "@/db/schema";
 
 // Tenant-scoped by companyId. Same Cache Components rule as data/jobs.ts.
 
+/** A candidate as listed in tables and exports: everything except the (potentially large) extracted CV text. */
+export type CandidateListItem = Omit<Candidate, "cvText">;
+
+/** A listed candidate plus its rank: 1-based position among *scored* candidates in the job (or stage), null if unscored. */
+export type RankedCandidate = CandidateListItem & { rank: number | null };
+
 export type CandidateListOptions = {
   stage?: CandidateStage;
-  /** Restrict to these ids (still scoped to the job + company, so foreign ids are silently dropped). */
+  /**
+   * Restrict the result to these ids (foreign ids are silently dropped). Ranks are still computed over the
+   * whole job/stage first, so an exported subset keeps the ranks shown on screen.
+   */
   ids?: string[];
 };
 
-/** Ranked list: highest score first, unscored (pending/failed) last, then oldest first. */
-export function listCandidatesForJob(companyId: string, jobId: string, opts: CandidateListOptions = {}): Candidate[] {
+const { cvText: _omit, ...listColumns } = getTableColumns(candidates);
+void _omit;
+
+/** Ranked list: highest score first, unscored (pending/failed) last, then oldest first, then id (stable). */
+export function listCandidatesForJob(companyId: string, jobId: string, opts: CandidateListOptions = {}): RankedCandidate[] {
   const where: SQL[] = [eq(candidates.companyId, companyId), eq(candidates.jobId, jobId)];
   if (opts.stage) where.push(eq(candidates.stage, opts.stage));
-  if (opts.ids) {
-    if (opts.ids.length === 0) return [];
-    where.push(inArray(candidates.id, opts.ids));
-  }
-  return db
-    .select()
+  const rows = db
+    .select(listColumns)
     .from(candidates)
     .where(and(...where))
-    .orderBy(sql`${candidates.score} is null`, sql`${candidates.score} desc`, asc(candidates.createdAt))
+    .orderBy(sql`${candidates.score} is null`, sql`${candidates.score} desc`, asc(candidates.createdAt), asc(candidates.id))
     .all();
+
+  let next = 0;
+  const ranked = rows.map((c) => ({ ...c, rank: c.score === null ? null : ++next }));
+  if (!opts.ids) return ranked;
+  const wanted = new Set(opts.ids);
+  return ranked.filter((c) => wanted.has(c.id));
 }
 
 export type CandidateWithJob = Candidate & { job: Job };

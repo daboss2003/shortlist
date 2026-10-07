@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import type { CandidateProfile, Evaluation } from "@/lib/ai/schemas";
 
 const id = () =>
@@ -16,6 +16,8 @@ export const companies = sqliteTable("companies", {
   name: text("name").notNull(),
   // Shown on the public apply page so applicants can verify the employer is real.
   website: text("website"),
+  // Days after a job closes before its candidates' CVs and profiles are deleted. null = keep (retention off).
+  retentionDays: integer("retention_days").default(90),
   createdAt: createdAt(),
 });
 
@@ -28,6 +30,8 @@ export const users = sqliteTable("users", {
   // Stored lowercased; uniqueness is global so login needs no company selector.
   email: text("email").notNull().unique(),
   passwordHash: text("password_hash").notNull(),
+  // Platform operator: can create company invites. Seeded from ADMIN_EMAIL / ADMIN_PASSWORD on boot.
+  isPlatformAdmin: integer("is_platform_admin", { mode: "boolean" }).notNull().default(false),
   createdAt: createdAt(),
 });
 
@@ -69,6 +73,8 @@ export const jobs = sqliteTable(
     skills: text("skills", { mode: "json" }).$type<string[]>().notNull().default(sql`'[]'`),
     minExperienceYears: integer("min_experience_years"),
     status: text("status", { enum: JOB_STATUSES }).notNull().default("open"),
+    // Set when the job is closed, cleared when reopened. Starts the candidate-data retention clock.
+    closedAt: integer("closed_at", { mode: "timestamp_ms" }),
     createdAt: createdAt(),
     updatedAt: integer("updated_at", { mode: "timestamp_ms" })
       .notNull()
@@ -110,6 +116,8 @@ export const candidates = sqliteTable(
     cvFileName: text("cv_file_name").notNull(),
     cvMimeType: text("cv_mime_type").notNull(),
     cvSize: integer("cv_size").notNull(),
+    // sha256 of the file bytes; used to skip identical employer uploads to the same job.
+    cvSha256: text("cv_sha256"),
     cvText: text("cv_text"),
     profile: text("profile", { mode: "json" }).$type<CandidateProfile>(),
     evaluation: text("evaluation", { mode: "json" }).$type<Evaluation>(),
@@ -119,6 +127,9 @@ export const candidates = sqliteTable(
     aiProvider: text("ai_provider"),
     aiModel: text("ai_model"),
     stage: text("stage", { enum: CANDIDATE_STAGES }).notNull().default("new"),
+    // Pipeline claims since the last (re)score request. Boot recovery gives up after a few, so one
+    // CV that keeps killing the process can't crash-loop the server.
+    attempts: integer("attempts").notNull().default(0),
     createdAt: createdAt(),
     processedAt: integer("processed_at", { mode: "timestamp_ms" }),
   },
@@ -130,7 +141,40 @@ export const candidates = sqliteTable(
     uniqueIndex("candidates_public_job_email_uq")
       .on(t.jobId, t.email)
       .where(sql`source = 'public'`),
+    // An identical file uploaded twice by the employer to the same job is skipped.
+    uniqueIndex("candidates_upload_job_sha_uq")
+      .on(t.jobId, t.cvSha256)
+      .where(sql`source = 'upload'`),
   ],
+);
+
+/** One-time signup links. Signups are invite-only; links are created with `pnpm invite`. */
+export const invites = sqliteTable("invites", {
+  id: id(),
+  // sha256(token) — the raw token only exists in the emailed/shared link.
+  tokenHash: text("token_hash").notNull().unique(),
+  // When set, the invite can only be redeemed with this (lowercased) email.
+  email: text("email"),
+  expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+  usedAt: integer("used_at", { mode: "timestamp_ms" }),
+  usedByUserId: text("used_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  // Admin can revoke an unused invite; revoked invites can't be redeemed.
+  revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
+  createdByUserId: text("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: createdAt(),
+});
+
+/** AI analyses per company per UTC day, for the daily cap (AI_DAILY_LIMIT). */
+export const aiUsage = sqliteTable(
+  "ai_usage",
+  {
+    companyId: text("company_id")
+      .notNull()
+      .references(() => companies.id, { onDelete: "cascade" }),
+    day: text("day").notNull(), // YYYY-MM-DD (UTC)
+    analyses: integer("analyses").notNull().default(0),
+  },
+  (t) => [primaryKey({ columns: [t.companyId, t.day] })],
 );
 
 export type Company = typeof companies.$inferSelect;
@@ -139,3 +183,4 @@ export type Job = typeof jobs.$inferSelect;
 export type NewJob = typeof jobs.$inferInsert;
 export type Candidate = typeof candidates.$inferSelect;
 export type NewCandidate = typeof candidates.$inferInsert;
+export type Invite = typeof invites.$inferSelect;

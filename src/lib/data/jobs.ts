@@ -37,15 +37,32 @@ export function getJobForCompany(companyId: string, jobId: string): Job | null {
   return db.select().from(jobs).where(and(eq(jobs.id, jobId), eq(jobs.companyId, companyId))).get() ?? null;
 }
 
-export type PublicJob = Job & { companyName: string; companyWebsite: string | null };
+export type PublicJob = Job & {
+  companyName: string;
+  companyWebsite: string | null;
+  /** Days after the job closes before applicants' data is deleted; null = retention off. */
+  companyRetentionDays: number | null;
+};
 
 /** Public apply page lookup. Returns closed jobs too so the page can say the role is closed. */
 export function getPublicJobBySlug(slug: string): PublicJob | null {
   const row = db
-    .select({ job: jobs, companyName: companies.name, companyWebsite: companies.website })
+    .select({
+      job: jobs,
+      companyName: companies.name,
+      companyWebsite: companies.website,
+      companyRetentionDays: companies.retentionDays,
+    })
     .from(jobs)
     .innerJoin(companies, eq(companies.id, jobs.companyId))
     .where(eq(jobs.slug, slug))
     .get();
-  return row ? { ...row.job, companyName: row.companyName, companyWebsite: row.companyWebsite } : null;
+  return row
+    ? {
+        ...row.job,
+        companyName: row.companyName,
+        companyWebsite: row.companyWebsite,
+        companyRetentionDays: row.companyRetentionDays,
+      }
+    : null;
 }
