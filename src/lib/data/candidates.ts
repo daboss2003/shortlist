@@ -24,15 +24,18 @@ const { cvText: _omit, ...listColumns } = getTableColumns(candidates);
 void _omit;
 
 /** Ranked list: highest score first, unscored (pending/failed) last, then oldest first, then id (stable). */
-export function listCandidatesForJob(companyId: string, jobId: string, opts: CandidateListOptions = {}): RankedCandidate[] {
+export async function listCandidatesForJob(
+  companyId: string,
+  jobId: string,
+  opts: CandidateListOptions = {},
+): Promise<RankedCandidate[]> {
   const where: SQL[] = [eq(candidates.companyId, companyId), eq(candidates.jobId, jobId)];
   if (opts.stage) where.push(eq(candidates.stage, opts.stage));
-  const rows = db
+  const rows = await db
     .select(listColumns)
     .from(candidates)
     .where(and(...where))
-    .orderBy(sql`${candidates.score} is null`, sql`${candidates.score} desc`, asc(candidates.createdAt), asc(candidates.id))
-    .all();
+    .orderBy(sql`${candidates.score} is null`, sql`${candidates.score} desc`, asc(candidates.createdAt), asc(candidates.id));
 
   let next = 0;
   const ranked = rows.map((c) => ({ ...c, rank: c.score === null ? null : ++next }));
@@ -43,12 +46,12 @@ export function listCandidatesForJob(companyId: string, jobId: string, opts: Can
 
 export type CandidateWithJob = Candidate & { job: Job };
 
-export function getCandidateForCompany(companyId: string, candidateId: string): CandidateWithJob | null {
-  const row = db
+export async function getCandidateForCompany(companyId: string, candidateId: string): Promise<CandidateWithJob | null> {
+  const [row] = await db
     .select({ candidate: candidates, job: jobs })
     .from(candidates)
     .innerJoin(jobs, eq(jobs.id, candidates.jobId))
     .where(and(eq(candidates.id, candidateId), eq(candidates.companyId, companyId)))
-    .get();
+    .limit(1);
   return row ? { ...row.candidate, job: row.job } : null;
 }

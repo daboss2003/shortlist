@@ -1,42 +1,78 @@
 import "server-only";
 import fs from "node:fs";
 import path from "node:path";
-import Database from "better-sqlite3";
-import { drizzle, type BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { migrate } from "drizzle-orm/better-sqlite3/migrator";
+import { PGlite } from "@electric-sql/pglite";
+import { Pool } from "@neondatabase/serverless";
+import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
+import { drizzle as drizzleNeon } from "drizzle-orm/neon-serverless";
+import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
+import { migrate as migratePglite } from "drizzle-orm/pglite/migrator";
 import * as schema from "./schema";
 
-export type Db = BetterSQLite3Database<typeof schema> & { $client: Database.Database };
+/** Driver-neutral handle. Never rely on a driver-specific result shape (e.g. rowCount): use `.returning()`. */
+export type Db = PgDatabase<PgQueryResultHKT, typeof schema>;
 
-function createDb(): Db {
-  const file = process.env.DATABASE_PATH ?? path.join(/*turbopackIgnore: true*/ process.cwd(), "data", "app.db");
-  if (file !== ":memory:") fs.mkdirSync(path.dirname(file), { recursive: true });
+type DbState = { db: Db; ready: Promise<void> };
 
-  const sqlite = new Database(file);
-  sqlite.pragma("journal_mode = WAL");
-  sqlite.pragma("foreign_keys = ON");
-  sqlite.pragma("busy_timeout = 5000");
-  // Deleted CVs/profiles are overwritten on disk, not just unlinked — retention deletes must really erase.
-  sqlite.pragma("secure_delete = ON");
+function createDb(): DbState {
+  const url = process.env.DATABASE_URL;
+  if (url) {
+    // Production (Netlify + Neon). Migrations are applied at deploy time by `pnpm db:migrate`, never here.
+    const pool = new Pool({ connectionString: url, max: 5, idleTimeoutMillis: 10_000 });
+    // Intentional: Neon closes idle connections; without a listener that error would crash the function.
+    pool.on("error", (err: Error) => console.error("[db] idle client error:", err.message));
+    return { db: drizzleNeon({ client: pool, schema }) as unknown as Db, ready: Promise.resolve() };
+  }
 
-  const db = drizzle(sqlite, { schema });
-  migrate(db, { migrationsFolder: path.join(/*turbopackIgnore: true*/ process.cwd(), "drizzle") });
-  return db;
+  // Local dev and tests: embedded Postgres (PGlite) — no account, server or Docker needed.
+  const dir = process.env.PGLITE_DIR ?? path.join(/*turbopackIgnore: true*/ process.cwd(), "data", "pglite");
+  if (dir !== "memory://") {
+    fs.mkdirSync(dir, { recursive: true });
+    claimLocalDbLock(dir);
+  }
+  const db = drizzlePglite({ client: new PGlite(dir === "memory://" ? undefined : dir), schema }) as unknown as Db;
+  const ready = migratePglite(db as never, {
+    migrationsFolder: path.join(/*turbopackIgnore: true*/ process.cwd(), "drizzle"),
+  });
+  return { db, ready };
 }
 
-// Intentional: cached on globalThis so dev hot reloads and the several module copies Next creates per
-// server bundle share one SQLite handle, and migrations run once per process.
-const globalForDb = globalThis as unknown as { __cvDb?: Db };
-const getDb = (): Db => (globalForDb.__cvDb ??= createDb());
+/**
+ * PGlite can't be shared between processes: a second process (e.g. `pnpm invite` while `pnpm dev` runs) would write
+ * changes this one never sees and later overwrites. Record our pid so tools can refuse instead of losing data.
+ */
+function claimLocalDbLock(dir: string) {
+  const lockFile = path.join(dir, ".app.lock");
+  try {
+    fs.writeFileSync(lockFile, String(process.pid));
+    process.once("exit", () => {
+      try {
+        if (fs.readFileSync(lockFile, "utf8") === String(process.pid)) fs.rmSync(lockFile);
+      } catch {
+        // Intentional: best effort; a stale lock with a dead pid is ignored by readers.
+      }
+    });
+  } catch (err) {
+    console.error("[db] could not write the local database lock:", err instanceof Error ? err.message : err);
+  }
+}
+
+// Intentional: cached on globalThis so dev hot reloads and Next's per-bundle module copies share one pool.
+const globalForDb = globalThis as unknown as { __cvDb?: DbState };
+const state = (): DbState => (globalForDb.__cvDb ??= createDb());
 
 /**
- * Lazy handle: the database is opened (and migrated) on first use at runtime, never merely by importing
- * this module — `next build` imports every route and must not create or migrate the live database.
+ * Lazy handle: nothing connects merely by importing this module, so `next build` never touches a database.
  */
 export const db: Db = new Proxy({} as Db, {
   get(_target, prop) {
-    const instance = getDb();
+    const instance = state().db;
     const value = Reflect.get(instance, prop, instance);
     return typeof value === "function" ? value.bind(instance) : value;
   },
 });
+
+/** Resolves once the local (PGlite) schema is migrated. A no-op in production. Await before the first query. */
+export function ensureDbReady(): Promise<void> {
+  return state().ready;
+}

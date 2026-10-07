@@ -14,27 +14,32 @@ export type JobWithStats = Job & {
   topScore: number | null;
 };
 
-export function listJobsWithStats(companyId: string): JobWithStats[] {
-  return db
+export async function listJobsWithStats(companyId: string): Promise<JobWithStats[]> {
+  // Intentional: ::int casts — Postgres count() is bigint, which drivers return as a string.
+  const rows = await db
     .select({
       job: jobs,
-      candidateCount: sql<number>`count(${candidates.id})`,
-      readyCount: sql<number>`count(case when ${candidates.status} = 'ready' then 1 end)`,
-      pendingCount: sql<number>`count(case when ${candidates.status} in ('pending','processing') then 1 end)`,
-      shortlistedCount: sql<number>`count(case when ${candidates.stage} = 'shortlisted' then 1 end)`,
-      topScore: sql<number | null>`max(${candidates.score})`,
+      candidateCount: sql<number>`count(${candidates.id})::int`,
+      readyCount: sql<number>`count(case when ${candidates.status} = 'ready' then 1 end)::int`,
+      pendingCount: sql<number>`count(case when ${candidates.status} in ('pending','processing') then 1 end)::int`,
+      shortlistedCount: sql<number>`count(case when ${candidates.stage} = 'shortlisted' then 1 end)::int`,
+      topScore: sql<number | null>`max(${candidates.score})::int`,
     })
     .from(jobs)
     .leftJoin(candidates, eq(candidates.jobId, jobs.id))
     .where(eq(jobs.companyId, companyId))
     .groupBy(jobs.id)
-    .orderBy(desc(jobs.createdAt))
-    .all()
-    .map(({ job, ...stats }) => ({ ...job, ...stats }));
+    .orderBy(desc(jobs.createdAt));
+  return rows.map(({ job, ...stats }) => ({ ...job, ...stats }));
 }
 
-export function getJobForCompany(companyId: string, jobId: string): Job | null {
-  return db.select().from(jobs).where(and(eq(jobs.id, jobId), eq(jobs.companyId, companyId))).get() ?? null;
+export async function getJobForCompany(companyId: string, jobId: string): Promise<Job | null> {
+  const [job] = await db
+    .select()
+    .from(jobs)
+    .where(and(eq(jobs.id, jobId), eq(jobs.companyId, companyId)))
+    .limit(1);
+  return job ?? null;
 }
 
 export type PublicJob = Job & {
@@ -45,8 +50,8 @@ export type PublicJob = Job & {
 };
 
 /** Public apply page lookup. Returns closed jobs too so the page can say the role is closed. */
-export function getPublicJobBySlug(slug: string): PublicJob | null {
-  const row = db
+export async function getPublicJobBySlug(slug: string): Promise<PublicJob | null> {
+  const [row] = await db
     .select({
       job: jobs,
       companyName: companies.name,
@@ -56,7 +61,7 @@ export function getPublicJobBySlug(slug: string): PublicJob | null {
     .from(jobs)
     .innerJoin(companies, eq(companies.id, jobs.companyId))
     .where(eq(jobs.slug, slug))
-    .get();
+    .limit(1);
   return row
     ? {
         ...row.job,

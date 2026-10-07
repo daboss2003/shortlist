@@ -62,7 +62,7 @@ export async function createCandidateFromCv(input: CreateCandidateInput): Promis
 
   const key = await saveCvFile(cv.bytes, cv.fileType);
   try {
-    return db
+    const [candidate] = await db
       .insert(candidates)
       .values({
         jobId: job.id,
@@ -78,8 +78,8 @@ export async function createCandidateFromCv(input: CreateCandidateInput): Promis
         cvSha256: cv.sha256,
         status: "pending",
       })
-      .returning()
-      .get();
+      .returning();
+    return candidate;
   } catch (err) {
     await deleteCvFile(key);
     // Each source has exactly one partial unique index, so the source tells us which rule was hit.
@@ -93,9 +93,10 @@ export async function createCandidateFromCv(input: CreateCandidateInput): Promis
   }
 }
 
+/** Postgres unique_violation (23505). Drizzle may wrap the driver error, so check its cause too. */
 function isUniqueViolation(err: unknown): boolean {
   const code = (err as { code?: string })?.code ?? (err as { cause?: { code?: string } })?.cause?.code;
-  return code === "SQLITE_CONSTRAINT_UNIQUE";
+  return code === "23505";
 }
 
 /** Keep the original name for display/download only: strip paths and control chars, cap length. */

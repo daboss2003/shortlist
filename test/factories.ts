@@ -4,18 +4,17 @@ import { companies, jobs, users } from "@/db/schema";
 let n = 0;
 
 /** Creates a company + one user. Password hash is a placeholder; use hashPassword() when a test logs in. */
-export function makeCompany(name = `Acme ${++n}`) {
-  const company = db.insert(companies).values({ name }).returning().get();
-  const user = db
+export async function makeCompany(name = `Acme ${++n}`) {
+  const [company] = await db.insert(companies).values({ name }).returning();
+  const [user] = await db
     .insert(users)
-    .values({ companyId: company.id, name: "Owner", email: `owner${++n}@example.com`, passwordHash: "x" })
-    .returning()
-    .get();
+    .values({ companyId: company.id, name: "Owner", email: `owner${++n}-${crypto.randomUUID().slice(0, 8)}@example.com`, passwordHash: "x" })
+    .returning();
   return { company, user };
 }
 
-export function makeJob(companyId: string, overrides: Partial<typeof jobs.$inferInsert> = {}) {
-  return db
+export async function makeJob(companyId: string, overrides: Partial<typeof jobs.$inferInsert> = {}) {
+  const [job] = await db
     .insert(jobs)
     .values({
       companyId,
@@ -27,6 +26,6 @@ export function makeJob(companyId: string, overrides: Partial<typeof jobs.$infer
       minExperienceYears: 5,
       ...overrides,
     })
-    .returning()
-    .get();
+    .returning();
+  return job;
 }

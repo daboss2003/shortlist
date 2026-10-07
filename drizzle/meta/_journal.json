@@ -1,26 +1,12 @@
 {
   "version": "7",
-  "dialect": "sqlite",
+  "dialect": "postgresql",
   "entries": [
     {
       "idx": 0,
-      "version": "6",
-      "when": 1791374520431,
+      "version": "7",
+      "when": 1791387305347,
       "tag": "0000_init",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "6",
-      "when": 1791379173150,
-      "tag": "0001_data_retention",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "6",
-      "when": 1791383738582,
-      "tag": "0002_hardening_invites_quota",
       "breakpoints": true
     }
   ]
