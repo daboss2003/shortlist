@@ -38,9 +38,11 @@ pnpm dev                        # http://localhost:3000
 1. **Neon:** create a free project at [neon.com](https://neon.com) and copy the **pooled** connection string.
 2. **Inngest:** create a free account at [inngest.com](https://www.inngest.com), create an app, and copy its
    **Event key** and **Signing key**.
-3. **Netlify:** import the repository. The build settings come from `netlify.toml`; the build runs
-   `pnpm db:migrate && pnpm build`, so the database is migrated before each deploy goes live. Under
-   *Site configuration → Environment variables* set:
+3. **Netlify:** import the repository. The build settings come from `netlify.toml`. Production deploys run
+   `pnpm db:migrate && pnpm build`, so the database is migrated before each deploy goes live. Deploy previews and
+   branch deploys only build; they never migrate. Under *Site configuration → Environment variables* set the following,
+   **scoped to the Production context** so a pull-request preview can never read or write production data (for
+   previews, use a separate Neon branch's URL, or leave them unset):
    - `DATABASE_URL` (Neon), `INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY`
    - at least one AI key, e.g. `GEMINI_API_KEY`
    - `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and `APP_URL` (your site URL)

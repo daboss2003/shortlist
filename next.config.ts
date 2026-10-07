@@ -19,6 +19,11 @@ const nextConfig: NextConfig = {
   partialPrefetching: true,
   // Native/Node-only libraries used by the CV pipeline and exports must not be bundled.
   serverExternalPackages: ["@electric-sql/pglite", "unpdf", "mammoth", "exceljs", "jszip", "word-extractor"],
+  // CV_EXTRACTION=isolated spawns this script as a child process, so it isn't import-traced; ship it explicitly
+  // (Netlify's Next.js runtime bundles from Next's file traces, not netlify.toml included_files).
+  outputFileTracingIncludes: {
+    "/**": ["./scripts/extract-cv-text.mjs", "./src/lib/cv/extract-core.mjs"],
+  },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },

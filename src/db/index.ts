@@ -2,9 +2,10 @@ import "server-only";
 import fs from "node:fs";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
-import { Pool } from "@neondatabase/serverless";
+import { Pool, neon } from "@neondatabase/serverless";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
-import { drizzle as drizzleNeon } from "drizzle-orm/neon-serverless";
+import { drizzle as drizzleNeonHttp } from "drizzle-orm/neon-http";
+import { drizzle as drizzleNeonPool } from "drizzle-orm/neon-serverless";
 import { drizzle as drizzlePglite } from "drizzle-orm/pglite";
 import { migrate as migratePglite } from "drizzle-orm/pglite/migrator";
 import * as schema from "./schema";
@@ -18,10 +19,23 @@ function createDb(): DbState {
   const url = process.env.DATABASE_URL;
   if (url) {
     // Production (Netlify + Neon). Migrations are applied at deploy time by `pnpm db:migrate`, never here.
-    const pool = new Pool({ connectionString: url, max: 5, idleTimeoutMillis: 10_000 });
-    // Intentional: Neon closes idle connections; without a listener that error would crash the function.
-    pool.on("error", (err: Error) => console.error("[db] idle client error:", err.message));
-    return { db: drizzleNeon({ client: pool, schema }) as unknown as Db, ready: Promise.resolve() };
+    // Intentional: queries go over Neon's stateless HTTP endpoint — a pooled socket kept at module scope can be
+    // handed out stale after a serverless freeze/thaw (Neon's guidance: a Pool must not outlive a request).
+    // Interactive transactions need a session, so each one gets a short-lived pool that is closed right after.
+    const http = drizzleNeonHttp({ client: neon(url), schema }) as unknown as Db;
+    const transaction: Db["transaction"] = async (fn, config) => {
+      const pool = new Pool({ connectionString: url, max: 1, connectionTimeoutMillis: 10_000 });
+      pool.on("error", (err: Error) => console.error("[db] pool client error:", err.message));
+      try {
+        return await (drizzleNeonPool({ client: pool, schema }) as unknown as Db).transaction(fn, config);
+      } finally {
+        await pool.end().catch(() => undefined);
+      }
+    };
+    const db = new Proxy(http, {
+      get: (target, prop, receiver) => (prop === "transaction" ? transaction : Reflect.get(target, prop, receiver)),
+    });
+    return { db, ready: Promise.resolve() };
   }
 
   // Local dev and tests: embedded Postgres (PGlite) — no account, server or Docker needed.

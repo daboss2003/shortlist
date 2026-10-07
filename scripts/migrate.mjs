@@ -11,6 +11,11 @@ try {
 
 const url = process.env.DATABASE_URL;
 if (!url) {
+  // On a Netlify production build a missing URL is a misconfiguration: shipping would leave the site with no schema.
+  if (process.env.NETLIFY === "true" && process.env.CONTEXT === "production") {
+    console.error("[migrate] DATABASE_URL is not set for the Production context — set it in Netlify and redeploy.");
+    process.exit(1);
+  }
   console.log("[migrate] DATABASE_URL not set — skipping (local dev uses embedded PGlite).");
   process.exit(0);
 }

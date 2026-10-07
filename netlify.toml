@@ -1,13 +1,14 @@
 [build]
-  # Migrate Neon first so the schema is ready before the new functions go live.
-  command = "pnpm db:migrate && pnpm build"
+  # Deploy previews and branch deploys only build. Intentional: they must never migrate (or, ideally, even reach)
+  # the production database — scope DATABASE_URL and the Inngest keys to the Production context in Netlify.
+  command = "pnpm build"
   publish = ".next"
+
+[context.production]
+  # Migrate Neon first so the schema is ready before the new functions go live. Fails the deploy if
+  # DATABASE_URL is missing, instead of shipping an app with no schema.
+  command = "pnpm db:migrate && pnpm build"
 
 [build.environment]
   NODE_VERSION = "22"
   NETLIFY_NEXT_SKEW_PROTECTION = "true"
-
-[functions]
-  # On Netlify CV text is extracted inline (each invocation is already isolated). The isolated child-process mode
-  # (CV_EXTRACTION=isolated) needs these files, so ship them to keep that switch working.
-  included_files = ["scripts/extract-cv-text.mjs", "src/lib/cv/extract-core.mjs"]
