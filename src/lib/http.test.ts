@@ -60,6 +60,28 @@ describe("clientIp", () => {
 describe("clientIp on Netlify", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  it("trusts x-nf-client-connection-ip inside a Netlify Function, where NETLIFY isn't set but the Netlify global is", () => {
+    vi.stubEnv("NETLIFY", undefined);
+    vi.stubGlobal("Netlify", { env: {} });
+    const headers = { "x-nf-client-connection-ip": "198.51.100.23", "x-forwarded-for": "1.1.1.1, 203.0.113.9" };
+    expect(clientIp(req(headers))).toBe("198.51.100.23");
+    expect(clientIpFromHeaders(new Headers(headers))).toBe("198.51.100.23");
+  });
+
+  it("gives different clients different IPs inside a Netlify Function, even with one shared X-Forwarded-For", () => {
+    vi.stubEnv("NETLIFY", undefined);
+    vi.stubGlobal("Netlify", { env: {} });
+    const viaEdge = (ip: string) => clientIp(req({ "x-nf-client-connection-ip": ip, "x-forwarded-for": "10.0.0.1" }));
+    expect(viaEdge("198.51.100.1")).not.toBe(viaEdge("198.51.100.2"));
+  });
+
+  it("doesn't trust it with neither NETLIFY=true nor the Netlify global", () => {
+    vi.stubEnv("NETLIFY", undefined);
+    expect("Netlify" in globalThis).toBe(false);
+    expect(clientIp(req({ "x-nf-client-connection-ip": "6.6.6.6", "x-forwarded-for": "203.0.113.9" }))).toBe("203.0.113.9");
   });
 
   it("uses x-nf-client-connection-ip, which Netlify's edge sets, over any X-Forwarded-For", () => {

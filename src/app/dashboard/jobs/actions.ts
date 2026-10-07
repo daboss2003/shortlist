@@ -80,8 +80,15 @@ export async function updateJobAction(jobId: string, _prev: JobFormState, formDa
 
 export async function deleteJobAction(jobId: string): Promise<void> {
   const { companyId, job } = await requireOwnJob(jobId);
-  if (!(await jobService.deleteJob(companyId, job.id))) notFound();
+  const result = await jobService.deleteJob(companyId, job.id);
+  if (result === "not-found") notFound();
+  // An incomplete delete still removed some candidates.
   revalidateJobViews(job);
+  if (result === "incomplete") {
+    // Intentional: thrown, not returned — the delete form has no error state, so the dashboard error boundary
+    // ("Something went wrong", Try again) shows it. The job is kept, and deleting it again finishes the job.
+    throw new Error("Some of this job's CV files couldn't be deleted, so the job was kept. Try again.");
+  }
   redirect("/dashboard");
 }
 

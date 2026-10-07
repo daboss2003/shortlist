@@ -47,6 +47,15 @@ describe("updateCompanyProfile", () => {
     expect(await companyRow(company.id)).toMatchObject({ name: "Before", website: null });
   });
 
+  it("returns a field error for a NUL character instead of a failed update", async () => {
+    const { company } = await makeCompany("Before");
+    expect(await updateCompanyProfile(company.id, { name: "Init\u0000ech", website: "initech.com/\u0000" })).toEqual({
+      ok: false,
+      fieldErrors: { name: "Contains an invalid character.", website: "Contains an invalid character." },
+    });
+    expect(await companyRow(company.id)).toMatchObject({ name: "Before", website: null });
+  });
+
   it("only changes the given company", async () => {
     const a = await makeCompany("A Corp");
     const b = await makeCompany("B Corp");

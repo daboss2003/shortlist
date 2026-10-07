@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { companies, invites, users } from "@/db/schema";
-import { authenticate, registerCompany as registerWithInvite, signupSchema } from "./accounts";
+import { accountExists, authenticate, registerCompany as registerWithInvite, signupSchema } from "./accounts";
 import { INVITE_ERROR, createInvite, hashInviteToken, revokeInvite } from "./invites";
 import { verifyPassword } from "./password";
 
@@ -74,6 +74,28 @@ describe("registerCompany", () => {
     if (result.ok) return;
     expect(Object.keys(result.fieldErrors).sort()).toEqual(["companyName", "email", "name", "password", "website"]);
     expect(await counts()).toEqual(before);
+  });
+});
+
+describe("registerCompany with a NUL character", () => {
+  it("returns a field error for each text field instead of a failed insert, writing nothing", async () => {
+    const before = await counts();
+    for (const [field, value] of [
+      ["companyName", "Acme\u0000 Logistics"],
+      ["website", "acme.com/\u0000"],
+      ["name", "Jane\u0000"],
+      ["email", "jane\u0000@acme.com"],
+    ] as const) {
+      const result = await registerCompany(signup({ [field]: value }));
+      expect(result, field).toEqual({ ok: false, fieldErrors: { [field]: "Contains an invalid character." } });
+    }
+    expect(await counts()).toEqual(before);
+  });
+
+  it("accepts a NUL in the password, which is only ever hashed", async () => {
+    const result = await registerCompany(signup({ email: "nul-password@acme.com", password: "correct\u0000horse" }));
+    if (!result.ok) throw new Error("expected signup to succeed");
+    expect(await authenticate("nul-password@acme.com", "correct\u0000horse")).toBe(result.userId);
   });
 });
 
@@ -202,6 +224,13 @@ describe("authenticate", () => {
     await registerCompany(signup({ email: "wrongpw@acme.com" }));
     expect(await authenticate("wrongpw@acme.com", "correct horse battery!")).toBeNull();
     expect(await authenticate("wrongpw@acme.com", "")).toBeNull();
+  });
+
+  it("returns null for an email with a NUL character, without querying, after a full password check", async () => {
+    vi.mocked(verifyPassword).mockClear();
+    expect(await authenticate("login\u0000@acme.com", "correct horse battery")).toBeNull();
+    expect(verifyPassword).toHaveBeenCalledTimes(1);
+    expect(await accountExists("login\u0000@acme.com")).toBe(false);
   });
 
   it("returns null for an unknown email but still runs a full password check", async () => {

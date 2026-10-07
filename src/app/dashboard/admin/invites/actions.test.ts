@@ -91,6 +91,16 @@ describe("createInviteAction", () => {
     expect(await inviteCount()).toBe(before);
   });
 
+  it("returns a field error for a NUL character in the email, creating nothing", async () => {
+    await signIn({ admin: true });
+    const before = await inviteCount();
+    expect(await createInviteAction({}, form({ email: "hiring\u0000@globex.com", days: "14" }))).toEqual({
+      fieldErrors: { email: "Contains an invalid character.", days: undefined },
+      values: { email: "hiring\u0000@globex.com", days: "14" },
+    });
+    expect(await inviteCount()).toBe(before);
+  });
+
   it("refuses an email that already has an account", async () => {
     const admin = await signIn({ admin: true });
     const before = await inviteCount();
@@ -120,6 +130,7 @@ describe("revokeInviteAction", () => {
   it("ignores malformed and unknown ids", async () => {
     await signIn({ admin: true });
     await expect(revokeInviteAction("not-a-uuid")).resolves.toBeUndefined();
+    await expect(revokeInviteAction(`${crypto.randomUUID()}\u0000`)).resolves.toBeUndefined();
     await expect(revokeInviteAction(crypto.randomUUID())).resolves.toBeUndefined();
   });
 });

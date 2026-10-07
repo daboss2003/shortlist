@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { candidates, jobs } from "@/db/schema";
 import { createCandidateFromCv, type ValidatedCv } from "@/lib/candidates/intake";
+import * as storage from "@/lib/storage";
 import { cvFileExists } from "@/lib/storage";
 import { makeCompany } from "../../../test/factories";
 import {
@@ -54,6 +55,14 @@ const pdfCv = (): ValidatedCv => {
   };
 };
 const jobRow = async (id: string) => (await db.select().from(jobs).where(eq(jobs.id, id)))[0];
+/** A CV with its own sha256: identical employer uploads to one job are rejected as duplicates. */
+const uniqueCv = (): ValidatedCv => ({ ...pdfCv(), sha256: createHash("sha256").update(crypto.randomUUID()).digest("hex") });
+const candidateIds = async (jobId: string) =>
+  (await db.select({ id: candidates.id }).from(candidates).where(eq(candidates.jobId, jobId))).map((r) => r.id).sort();
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("parseJobInput", () => {
   it("trims text and turns blank optional fields into null", () => {
@@ -101,6 +110,16 @@ describe("parseJobInput", () => {
     for (const bad of ["-1", "51", "2.5", "five"]) {
       expect(errorsFor({ minExperienceYears: bad }).minExperienceYears).toBeTruthy();
     }
+  });
+
+  it("reports a NUL character in any text field as a field error, never a failed insert", () => {
+    const fields = ["title", "department", "location", "description", "requirements", "skills"] as const;
+    for (const field of fields) {
+      expect(errorsFor({ [field]: "Back\u0000end" })[field], field).toBe("Contains an invalid character.");
+    }
+    expect(errorsFor({ skills: ["Go", "Ru\u0000st"] }).skills).toBe("Contains an invalid character.");
+    expect(errorsFor({ employmentType: "full_time\u0000" }).employmentType).toBeTruthy();
+    expect(errorsFor({ minExperienceYears: "5\u0000" }).minExperienceYears).toBeTruthy();
   });
 
   it("reports a field error for each invalid field", () => {
@@ -262,7 +281,7 @@ describe("deleteJob", () => {
     expect(await countJobCandidates(company.id, job.id)).toBe(2);
     expect((await cvFileExists(c1.cvFileKey)) && (await cvFileExists(c2.cvFileKey))).toBe(true);
 
-    expect(await deleteJob(company.id, job.id)).toBe(true);
+    expect(await deleteJob(company.id, job.id)).toBe("deleted");
 
     expect(await jobRow(job.id)).toBeUndefined();
     expect(await db.select().from(candidates).where(eq(candidates.jobId, job.id))).toEqual([]);
@@ -278,10 +297,84 @@ describe("deleteJob", () => {
     const job = await createJob(a.company.id, parse());
     const c = await createCandidateFromCv({ job, source: "upload", cv: pdfCv() });
 
-    expect(await deleteJob(b.company.id, job.id)).toBe(false);
-    expect(await deleteJob(a.company.id, "missing-id")).toBe(false);
+    const deleteSpy = vi.spyOn(storage, "deleteCvFile");
+    expect(await deleteJob(b.company.id, job.id)).toBe("not-found");
+    expect(await deleteJob(a.company.id, "missing-id")).toBe("not-found");
+    expect(deleteSpy).not.toHaveBeenCalled();
     expect(await countJobCandidates(b.company.id, job.id)).toBe(0);
     expect(await countJobCandidates(a.company.id, job.id)).toBe(1);
     expect(await cvFileExists(c.cvFileKey)).toBe(true);
+  });
+
+  it("deletes the files first: one that fails keeps the job and its candidate, the others are deleted", async () => {
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
+    const rows = [];
+    for (let i = 0; i < 5; i++) rows.push(await createCandidateFromCv({ job, source: "upload", cv: uniqueCv() }));
+    const stuck = rows[2];
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const realDelete = storage.deleteCvFile;
+    vi.spyOn(storage, "deleteCvFile").mockImplementation(async (key) => {
+      if (key === stuck.cvFileKey) throw new Error("Blobs unavailable");
+      return realDelete(key);
+    });
+
+    expect(await deleteJob(company.id, job.id)).toBe("incomplete");
+
+    expect(await jobRow(job.id)).toBeDefined();
+    expect(await candidateIds(job.id)).toEqual([stuck.id]);
+    // No file is left without a row: the stuck one is still stored and still referenced.
+    expect(await cvFileExists(stuck.cvFileKey)).toBe(true);
+    for (const row of rows.filter((r) => r !== stuck)) expect(await cvFileExists(row.cvFileKey)).toBe(false);
+
+    // Once storage recovers, deleting again finishes the job.
+    vi.mocked(storage.deleteCvFile).mockRestore();
+    expect(await deleteJob(company.id, job.id)).toBe("deleted");
+    expect(await jobRow(job.id)).toBeUndefined();
+    expect(await cvFileExists(stuck.cvFileKey)).toBe(false);
+  });
+
+  it("deletes a job whose CV files are already missing", async () => {
+    const { company } = await makeCompany();
+    const job = await createJob(company.id, parse());
+    const c = await createCandidateFromCv({ job, source: "upload", cv: uniqueCv() });
+    await storage.deleteCvFile(c.cvFileKey);
+
+    expect(await deleteJob(company.id, job.id)).toBe("deleted");
+    expect(await jobRow(job.id)).toBeUndefined();
+  });
+
+  it("deletes files at most 8 at a time, and only the job's own", async () => {
+    const a = await makeCompany();
+    const b = await makeCompany();
+    const job = await createJob(a.company.id, parse());
+    const sibling = await createJob(a.company.id, parse({ title: "Keep me" }));
+    const foreignJob = await createJob(b.company.id, parse());
+    const keys = new Set<string>();
+    for (let i = 0; i < 20; i++) keys.add((await createCandidateFromCv({ job, source: "upload", cv: uniqueCv() })).cvFileKey);
+    const keptSibling = await createCandidateFromCv({ job: sibling, source: "upload", cv: uniqueCv() });
+    const keptForeign = await createCandidateFromCv({ job: foreignJob, source: "upload", cv: uniqueCv() });
+
+    const realDelete = storage.deleteCvFile;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const deleteSpy = vi.spyOn(storage, "deleteCvFile").mockImplementation(async (key) => {
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return await realDelete(key);
+      } finally {
+        inFlight--;
+      }
+    });
+
+    expect(await deleteJob(a.company.id, job.id)).toBe("deleted");
+
+    expect(maxInFlight).toBe(8);
+    expect(new Set(deleteSpy.mock.calls.map(([key]) => key))).toEqual(keys);
+    expect(await cvFileExists(keptSibling.cvFileKey)).toBe(true);
+    expect(await cvFileExists(keptForeign.cvFileKey)).toBe(true);
+    expect(await countJobCandidates(a.company.id, sibling.id)).toBe(1);
+    expect(await countJobCandidates(b.company.id, foreignJob.id)).toBe(1);
   });
 });

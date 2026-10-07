@@ -13,6 +13,7 @@ import { clientIp, jsonError } from "@/lib/http";
 import { scheduleCandidateProcessing } from "@/lib/pipeline";
 import { rateLimit } from "@/lib/rate-limit";
 import { describeError } from "@/lib/log";
+import { safeText } from "@/lib/validation";
 
 type ApplyField = "name" | "email" | "phone" | "cv" | "consent";
 type FieldErrors = Partial<Record<ApplyField, string>>;
@@ -37,20 +38,17 @@ const MESSAGES = {
 } as const;
 
 const applicationSchema = z.object({
-  name: z
-    .string({ error: MESSAGES.nameRequired })
+  name: safeText({ error: MESSAGES.nameRequired })
     .trim()
     .min(1, MESSAGES.nameRequired)
     .max(120, MESSAGES.nameTooLong),
-  email: z
-    .string({ error: MESSAGES.emailRequired })
+  email: safeText({ error: MESSAGES.emailRequired })
     .trim()
     .toLowerCase()
     .min(1, MESSAGES.emailRequired)
     .max(200, MESSAGES.emailTooLong)
     .pipe(z.email(MESSAGES.emailInvalid)),
-  phone: z
-    .string({ error: MESSAGES.phoneInvalid })
+  phone: safeText({ error: MESSAGES.phoneInvalid })
     .trim()
     .max(40, MESSAGES.phoneTooLong)
     .regex(PHONE_PATTERN, MESSAGES.phoneInvalid)

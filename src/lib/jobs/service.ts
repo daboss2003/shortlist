@@ -1,10 +1,11 @@
 import "server-only";
 import { randomBytes } from "node:crypto";
-import { and, count, desc, eq, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { EMPLOYMENT_TYPES, candidates, jobs, type Job, type JobStatus } from "@/db/schema";
-import { deleteCvFile } from "@/lib/storage";
+import { deleteCvFilesFirst } from "@/lib/candidates/review";
+import { safeText } from "@/lib/validation";
 
 // Employer-side job writes. Every function is scoped by companyId: a foreign job behaves exactly like a missing one.
 
@@ -20,8 +21,7 @@ export const JOB_LIMITS = {
 } as const;
 
 const optionalText = (max: number, label: string) =>
-  z
-    .string()
+  safeText()
     .trim()
     .max(max, `Keep the ${label} under ${max} characters.`)
     .nullish()
@@ -45,7 +45,7 @@ const skillsSchema = z
   })
   .pipe(
     z
-      .array(z.string().max(JOB_LIMITS.skillLength, `Keep each skill under ${JOB_LIMITS.skillLength} characters.`))
+      .array(safeText().max(JOB_LIMITS.skillLength, `Keep each skill under ${JOB_LIMITS.skillLength} characters.`))
       .max(JOB_LIMITS.skills, `Add up to ${JOB_LIMITS.skills} skills.`),
   );
 
@@ -57,8 +57,7 @@ const minYearsSchema = z
   .pipe(z.number({ error: yearsError }).int(yearsError).min(0, yearsError).max(JOB_LIMITS.maxYears, yearsError).nullable());
 
 export const jobInputSchema = z.object({
-  title: z
-    .string()
+  title: safeText()
     .trim()
     .min(1, "Enter a job title.")
     .max(JOB_LIMITS.title, `Keep the title under ${JOB_LIMITS.title} characters.`),
@@ -69,13 +68,11 @@ export const jobInputSchema = z.object({
     .nullish()
     .transform((v) => v || null)
     .pipe(z.enum(EMPLOYMENT_TYPES, { error: "Choose an employment type from the list." }).nullable()),
-  description: z
-    .string()
+  description: safeText()
     .trim()
     .min(1, "Describe the role.")
     .max(JOB_LIMITS.description, "Keep the description under 20,000 characters."),
-  requirements: z
-    .string()
+  requirements: safeText()
     .trim()
     .max(JOB_LIMITS.requirements, "Keep the requirements under 20,000 characters.")
     .nullish()
@@ -177,28 +174,45 @@ export async function countJobCandidates(companyId: string, jobId: string): Prom
   return row?.n ?? 0;
 }
 
-/** Deletes the job (candidates cascade) and then its candidates' CV files. */
-export async function deleteJob(companyId: string, jobId: string): Promise<boolean> {
-  const fileKeys = await db.transaction(async (tx) => {
+/** Candidate ids per DELETE … IN (…), well under Postgres's bind-parameter limit. */
+const DELETE_ID_BATCH = 1000;
+
+/**
+ * - "deleted": the job, its candidates and their CV files are gone.
+ * - "not-found": missing or another company's job.
+ * - "incomplete": some CV files couldn't be deleted (or time ran out). The job is kept, with the candidates whose
+ *   file is still stored; calling again finishes the job.
+ */
+export type DeleteJobResult = "deleted" | "not-found" | "incomplete";
+
+/** Deletes the job's CV files, then the job (candidates cascade). */
+export async function deleteJob(companyId: string, jobId: string): Promise<DeleteJobResult> {
+  return db.transaction(async (tx) => {
     // Lock the job row first. A candidate insert takes a key-share lock on its job (the foreign key check), so this
-    // waits for in-flight applications to commit and blocks new ones until the job is gone (they then fail the FK
-    // check and remove their own file). The keys read next are therefore exactly the candidates the cascade deletes,
-    // and no CV file is left behind unreferenced.
+    // waits for in-flight applications to commit and blocks new ones until the transaction ends (if the job is then
+    // gone they fail the FK check and remove their own file). The rows read next are therefore all the job has.
     const [job] = await tx.select({ id: jobs.id }).from(jobs).where(ownJob(companyId, jobId)).for("update");
-    if (!job) return null;
+    if (!job) return "not-found";
     const rows = await tx
-      .select({ key: candidates.cvFileKey })
+      .select({ id: candidates.id, cvFileKey: candidates.cvFileKey })
       .from(candidates)
       .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, job.id)));
-    await tx.delete(jobs).where(ownJob(companyId, job.id));
-    return rows.map((r) => r.key);
-  });
-  if (!fileKeys) return false;
 
-  const results = await Promise.allSettled(fileKeys.map((key) => deleteCvFile(key)));
-  for (const [i, r] of results.entries()) {
-    // Intentional: the DB delete is the source of truth; a file that can't be removed is logged, not fatal.
-    if (r.status === "rejected") console.error(`Failed to delete CV file ${fileKeys[i]}`, r.reason);
-  }
-  return true;
+    // Intentional: files first, then rows (as in retention.ts). Deleting the rows first would leave any file that
+    // then fails to delete, or that a timeout cuts off, in storage with nothing pointing at it, never to be removed.
+    const { deleted, failed } = await deleteCvFilesFirst(rows);
+    if (failed.length === 0) {
+      await tx.delete(jobs).where(ownJob(companyId, job.id));
+      return "deleted";
+    }
+    // Keep the job and the candidates whose file is still stored; drop the ones whose file is gone, so a retry
+    // has only the rest to do and a job too big for one request still gets deleted over a few.
+    for (let i = 0; i < deleted.length; i += DELETE_ID_BATCH) {
+      const ids = deleted.slice(i, i + DELETE_ID_BATCH).map((row) => row.id);
+      await tx
+        .delete(candidates)
+        .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, job.id), inArray(candidates.id, ids)));
+    }
+    return "incomplete";
+  });
 }

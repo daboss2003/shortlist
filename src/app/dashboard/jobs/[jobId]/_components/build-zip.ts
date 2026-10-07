@@ -10,6 +10,12 @@ export const MAX_ZIP_CVS = 5000;
 export const MAX_ZIP_CV_BYTES = 1024 ** 3;
 export const ZIP_TOO_LARGE_MESSAGE = "Too many CVs for one ZIP — export a stage or a selection.";
 
+/**
+ * Query parameter on the export POST that asks for a ZIP's CSV/XLSX, pinned to the manifest's ids: the export
+ * route then accepts up to MAX_ZIP_CVS ids instead of a selection's 1000.
+ */
+export const ZIP_SPREADSHEET_QUERY = { name: "for", value: "zip" } as const;
+
 export function zipTooLarge(entries: Pick<ZipManifestEntry, "cvSize">[]): boolean {
   const totalBytes = entries.reduce((sum, e) => sum + e.cvSize, 0);
   return entries.length > MAX_ZIP_CVS || totalBytes > MAX_ZIP_CV_BYTES;

@@ -1,13 +1,26 @@
 import type { ZipManifest, ZipManifestEntry } from "@/app/api/jobs/[jobId]/export/route";
-import { ZIP_TOO_LARGE_MESSAGE, buildCandidatesZip, zipFileName, zipTooLarge, type FetchedCv } from "./build-zip";
+import {
+  ZIP_SPREADSHEET_QUERY,
+  ZIP_TOO_LARGE_MESSAGE,
+  buildCandidatesZip,
+  zipFileName,
+  zipTooLarge,
+  type FetchedCv,
+} from "./build-zip";
 import { fetchFile, type DownloadFailure, type FetchFileOutcome } from "./download";
 
 // Browser-side "ZIP of CVs": a server-built ZIP of many CVs can exceed Netlify's 20 MB response and 60 s limits,
-// so the browser fetches the manifest, the CSV, the XLSX and each CV separately and zips them itself.
+// so the browser fetches the manifest, the CSV, the XLSX and each CV separately and zips them itself. The CSV and
+// XLSX are asked for by the manifest's ids, so a CV that arrives in between can't put a row in the spreadsheets
+// that the ZIP has no CV for.
 
 const CV_CONCURRENCY = 3;
 
-/** The export request for a format, for the same selection (GET for a whole view, POST for selected ids). */
+/**
+ * The export request for a format, for the same selection (GET for a whole view, POST for selected ids). The
+ * request's fields (stage, …) must be in the URL's query string or a URLSearchParams body: the spreadsheets are
+ * re-sent from them as a POST of the manifest's ids (see spreadsheetRequest).
+ */
 export type ExportRequest = (format: "manifest" | "csv" | "xlsx") => [url: string, init?: RequestInit];
 
 export type ZipExportResult =
@@ -29,7 +42,11 @@ export async function prepareCvZip(
   if (zipTooLarge(candidates)) return { ok: false, sessionExpired: false, error: ZIP_TOO_LARGE_MESSAGE, status: 400 };
   onProgress(0, candidates.length);
 
-  const [csv, xlsx] = await Promise.all([fetchFile(...request("csv")), fetchFile(...request("xlsx"))]);
+  const ids = candidates.map((c) => c.id);
+  const [csv, xlsx] = await Promise.all([
+    fetchFile(...spreadsheetRequest(request, "csv", ids)),
+    fetchFile(...spreadsheetRequest(request, "xlsx", ids)),
+  ]);
   if (!csv.ok) return csv;
   if (!xlsx.ok) return xlsx;
 
@@ -44,6 +61,26 @@ export async function prepareCvZip(
     total: cvs.length,
     missing: cvs.filter((c) => !c.file).length,
   };
+}
+
+/**
+ * The caller's request for `format`, as a POST of exactly `ids` (the manifest's) to the same endpoint. The route
+ * ranks over the whole job (or stage) before keeping only the given ids, so the ranks are the manifest's too.
+ */
+export function spreadsheetRequest(
+  request: ExportRequest,
+  format: "csv" | "xlsx",
+  ids: string[],
+): [url: string, init: RequestInit] {
+  const [url, init] = request(format);
+  const queryStart = url.indexOf("?");
+  const path = queryStart === -1 ? url : url.slice(0, queryStart);
+  const fields = new URLSearchParams(queryStart === -1 ? "" : url.slice(queryStart + 1));
+  if (init?.body instanceof URLSearchParams) for (const [name, value] of init.body) fields.set(name, value);
+  fields.set("format", format);
+  fields.set("ids", ids.join(","));
+  const query = new URLSearchParams({ [ZIP_SPREADSHEET_QUERY.name]: ZIP_SPREADSHEET_QUERY.value });
+  return [`${path}?${query}`, { method: "POST", body: fields }];
 }
 
 const UNEXPECTED: DownloadFailure = {

@@ -1,12 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { db } from "@/db";
 import { candidates, type Candidate } from "@/db/schema";
+import * as storage from "@/lib/storage";
 import { makeCompany, makeJob } from "../../../test/factories";
 import { createCandidateFromCv, validateCvUpload } from "./intake";
-import { candidateDisplayName, deleteCandidate, deleteCandidates, markForRescore, setCandidatesStage } from "./review";
+import {
+  CandidateDeleteIncompleteError,
+  candidateDisplayName,
+  deleteCandidate,
+  deleteCandidates,
+  deleteCvFilesFirst,
+  markForRescore,
+  setCandidatesStage,
+} from "./review";
 
 // Unique bytes per file: identical employer uploads to one job are rejected as duplicates.
 const pdfFile = (name = "cv.pdf") =>
@@ -23,6 +32,20 @@ const getRow = async (id: string) => (await db.select().from(candidates).where(e
 const setRow = async (id: string, values: Partial<Candidate>) => {
   await db.update(candidates).set(values).where(eq(candidates.id, id));
 };
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+/** Makes deleteCvFile fail for `failing` keys (storage down for those files) and delete the rest for real. */
+function failDeletesFor(...failing: string[]) {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const realDelete = storage.deleteCvFile;
+  return vi.spyOn(storage, "deleteCvFile").mockImplementation(async (key) => {
+    if (failing.includes(key)) throw new Error("Blobs unavailable");
+    return realDelete(key);
+  });
+}
 
 async function twoTenants() {
   const a = await makeCompany();
@@ -153,6 +176,32 @@ describe("deleteCandidate", () => {
     const { a } = await twoTenants();
     expect(await deleteCandidate(a.company.id, crypto.randomUUID())).toBe(false);
   });
+
+  it("keeps the candidate when its file can't be deleted, so the file is never orphaned", async () => {
+    const { a, a1 } = await twoTenants();
+    failDeletesFor(a1.cvFileKey);
+
+    const attempt = deleteCandidate(a.company.id, a1.id);
+    await expect(attempt).rejects.toThrow(CandidateDeleteIncompleteError);
+    await expect(attempt).rejects.toThrow("Couldn't delete the CV file. Try again.");
+
+    expect(await getRow(a1.id)).toBeDefined();
+    expect(fs.existsSync(path.join(process.env.UPLOAD_DIR!, a1.cvFileKey))).toBe(true);
+  });
+
+  it("deletes the row when the file was already missing", async () => {
+    const { a, a1 } = await twoTenants();
+    await storage.deleteCvFile(a1.cvFileKey);
+    expect(await deleteCandidate(a.company.id, a1.id)).toBe(true);
+    expect(await getRow(a1.id)).toBeUndefined();
+  });
+
+  it("never touches another company's file", async () => {
+    const { a, b1 } = await twoTenants();
+    const deleteSpy = vi.spyOn(storage, "deleteCvFile");
+    expect(await deleteCandidate(a.company.id, b1.id)).toBe(false);
+    expect(deleteSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe("deleteCandidates", () => {
@@ -207,6 +256,124 @@ describe("deleteCandidates", () => {
     const { a, jobA } = await twoTenants();
     expect(await deleteCandidates(a.company.id, jobA.id, [])).toBe(0);
     expect(await deleteCandidates(a.company.id, jobA.id, [crypto.randomUUID()])).toBe(0);
+  });
+
+  it("deletes files first: a file that fails keeps exactly its candidate, and the others are deleted", async () => {
+    const { a, jobA, a1, a2 } = await twoTenants();
+    const a3 = await makeCandidate(jobA);
+    failDeletesFor(a2.cvFileKey);
+
+    const attempt = deleteCandidates(a.company.id, jobA.id, [a1.id, a2.id, a3.id]);
+    await expect(attempt).rejects.toThrow(CandidateDeleteIncompleteError);
+    await expect(attempt).rejects.toMatchObject({ deleted: 2, total: 3, message: "Deleted 2 of 3; try again for the rest." });
+
+    expect(await getRow(a1.id)).toBeUndefined();
+    expect(await getRow(a3.id)).toBeUndefined();
+    expect(fs.existsSync(cvPath(a1.cvFileKey))).toBe(false);
+    expect(fs.existsSync(cvPath(a3.cvFileKey))).toBe(false);
+    // The kept candidate still points at its file, so nothing is orphaned and a retry can finish.
+    expect(await getRow(a2.id)).toBeDefined();
+    expect(fs.existsSync(cvPath(a2.cvFileKey))).toBe(true);
+
+    vi.mocked(storage.deleteCvFile).mockRestore();
+    expect(await deleteCandidates(a.company.id, jobA.id, [a1.id, a2.id, a3.id])).toBe(1);
+    expect(await getRow(a2.id)).toBeUndefined();
+    expect(fs.existsSync(cvPath(a2.cvFileKey))).toBe(false);
+  });
+
+  it("deletes nothing and says so when every file fails", async () => {
+    const { a, jobA, a1, a2 } = await twoTenants();
+    failDeletesFor(a1.cvFileKey, a2.cvFileKey);
+    await expect(deleteCandidates(a.company.id, jobA.id, [a1.id, a2.id])).rejects.toMatchObject({
+      deleted: 0,
+      total: 2,
+      message: "Couldn't delete the CV files. Try again.",
+    });
+    expect(await getRow(a1.id)).toBeDefined();
+    expect(await getRow(a2.id)).toBeDefined();
+  });
+
+  it("deletes the rows whose files were already missing", async () => {
+    const { a, jobA, a1, a2 } = await twoTenants();
+    await storage.deleteCvFile(a1.cvFileKey);
+    expect(await deleteCandidates(a.company.id, jobA.id, [a1.id, a2.id])).toBe(2);
+    expect(await getRow(a1.id)).toBeUndefined();
+  });
+
+  it("deletes at most 8 files at a time", async () => {
+    const { a, jobA } = await twoTenants();
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) ids.push((await makeCandidate(jobA)).id);
+    const realDelete = storage.deleteCvFile;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.spyOn(storage, "deleteCvFile").mockImplementation(async (key) => {
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return await realDelete(key);
+      } finally {
+        inFlight--;
+      }
+    });
+
+    expect(await deleteCandidates(a.company.id, jobA.id, ids)).toBe(20);
+    expect(maxInFlight).toBe(8);
+  });
+
+  it("never touches files of another company's or another job's candidates", async () => {
+    const { a, jobA, a1, b1 } = await twoTenants();
+    const other = await makeCandidate(await makeJob(a.company.id));
+    const deleteSpy = vi.spyOn(storage, "deleteCvFile");
+
+    // Another company naming our job and our candidate gets nothing.
+    expect(await deleteCandidates(b1.companyId, jobA.id, [a1.id])).toBe(0);
+    expect(await deleteCandidate(b1.companyId, a1.id)).toBe(false);
+    expect(deleteSpy).not.toHaveBeenCalled();
+    expect(await getRow(a1.id)).toBeDefined();
+
+    expect(await deleteCandidates(a.company.id, jobA.id, [a1.id, b1.id, other.id])).toBe(1);
+    expect(deleteSpy.mock.calls).toEqual([[a1.cvFileKey]]);
+  });
+});
+
+describe("deleteCvFilesFirst", () => {
+  const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: i, cvFileKey: `${crypto.randomUUID()}.pdf` }));
+
+  it("starts no delete after the deadline and reports the rows it didn't reach as failed", async () => {
+    const all = rows(10);
+    const deadline = Date.now() + 60_000;
+    let started = 0;
+    // The clock passes the deadline once 4 deletes have started.
+    vi.spyOn(Date, "now").mockImplementation(() => (started >= 4 ? deadline : deadline - 1));
+    vi.spyOn(storage, "deleteCvFile").mockImplementation(async () => {
+      started++;
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    });
+
+    const { deleted, failed } = await deleteCvFilesFirst(all, { concurrency: 2, deadline });
+
+    expect(started).toBe(4);
+    expect(deleted).toEqual(all.slice(0, 4));
+    expect(failed).toEqual(all.slice(4));
+  });
+
+  it("returns both lists in input order whatever order the deletes finish in", async () => {
+    const all = rows(6);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(storage, "deleteCvFile").mockImplementation(async (key) => {
+      const i = all.findIndex((r) => r.cvFileKey === key);
+      await new Promise((resolve) => setTimeout(resolve, (6 - i) * 2));
+      if (i % 2 === 1) throw new Error("nope");
+    });
+
+    const { deleted, failed } = await deleteCvFilesFirst(all);
+    expect(deleted.map((r) => r.id)).toEqual([0, 2, 4]);
+    expect(failed.map((r) => r.id)).toEqual([1, 3, 5]);
+  });
+
+  it("does nothing for no rows", async () => {
+    expect(await deleteCvFilesFirst([])).toEqual({ deleted: [], failed: [] });
   });
 });
 

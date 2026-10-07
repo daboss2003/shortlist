@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { MAX_ZIP_CVS, ZIP_SPREADSHEET_QUERY } from "@/app/dashboard/jobs/[jobId]/_components/build-zip";
 import { CANDIDATE_STAGES, type Job } from "@/db/schema";
 import { getCurrentEmployer } from "@/lib/auth/dal";
 import { BodyTooLargeError, readFormDataWithLimit } from "@/lib/body-limit";
@@ -14,6 +15,9 @@ import { isSameOrigin, jsonError } from "@/lib/http";
 const MAX_GET_IDS = 300;
 const MAX_POST_IDS = 1000;
 const MAX_POST_BODY_BYTES = 64 * 1024;
+// A ZIP's CSV and XLSX are POSTed for exactly its manifest's ids, and a manifest lists up to MAX_ZIP_CVS. Each id
+// is 39 bytes in a urlencoded body (36 + an escaped comma), so 5000 fit in ~195 KB.
+const MAX_ZIP_POST_BODY_BYTES = 256 * 1024;
 
 const CONTENT_TYPES = {
   csv: "text/csv; charset=utf-8",
@@ -52,7 +56,7 @@ const exportFields = {
   stage: z.enum(CANDIDATE_STAGES, { error: "Invalid stage." }).optional(),
 };
 const getSchema = z.object({ ...exportFields, ids: idsSchema(MAX_GET_IDS).optional() });
-const postSchema = z.object({ ...exportFields, ids: idsSchema(MAX_POST_IDS) });
+const postSchema = (maxIds: number) => z.object({ ...exportFields, ids: idsSchema(maxIds) });
 
 type ExportQuery = z.infer<typeof getSchema>;
 
@@ -131,7 +135,10 @@ export async function GET(request: Request, ctx: RouteContext<"/api/jobs/[jobId]
   return exportCandidates(employer.companyId, job, query.data);
 }
 
-/** Same export for selections too long for a URL: form fields `format`, `stage?`, `ids` (comma-separated). */
+/**
+ * Same export for selections too long for a URL: form fields `format`, `stage?`, `ids` (comma-separated).
+ * With `?for=zip` (a ZIP's spreadsheets, pinned to its manifest) up to MAX_ZIP_CVS ids are accepted.
+ */
 export async function POST(request: Request, ctx: RouteContext<"/api/jobs/[jobId]/export">) {
   const employer = await getCurrentEmployer();
   if (!employer) return jsonError(401, "Not signed in.");
@@ -142,15 +149,19 @@ export async function POST(request: Request, ctx: RouteContext<"/api/jobs/[jobId
   const job = await getJobForCompany(employer.companyId, jobId);
   if (!job) return jsonError(404, "Job not found.");
 
+  // Decided from the URL, before the body is read, because it sets how much body to read.
+  const forZip = new URL(request.url).searchParams.get(ZIP_SPREADSHEET_QUERY.name) === ZIP_SPREADSHEET_QUERY.value;
+  const maxIds = forZip ? MAX_ZIP_CVS : MAX_POST_IDS;
+
   let form: FormData;
   try {
-    form = await readFormDataWithLimit(request, MAX_POST_BODY_BYTES);
+    form = await readFormDataWithLimit(request, forZip ? MAX_ZIP_POST_BODY_BYTES : MAX_POST_BODY_BYTES);
   } catch (err) {
-    if (err instanceof BodyTooLargeError) return jsonError(413, `You can export at most ${MAX_POST_IDS} selected candidates.`);
+    if (err instanceof BodyTooLargeError) return jsonError(413, `You can export at most ${maxIds} selected candidates.`);
     return jsonError(400, "Invalid export request.");
   }
 
-  const query = postSchema.safeParse({
+  const query = postSchema(maxIds).safeParse({
     format: optionalField(form.get("format")),
     stage: optionalField(form.get("stage")),
     ids: splitIds(form.getAll("ids")),

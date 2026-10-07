@@ -71,6 +71,19 @@ describe("updateCompanyProfileAction", () => {
   });
 });
 
+describe("updateCompanyProfileAction with a NUL character", () => {
+  it("returns a field error instead of throwing, and saves nothing", async () => {
+    const company = await signIn();
+    const state = await updateCompanyProfileAction({}, form({ name: "Init\u0000ech", website: "" }));
+    expect(state).toEqual({
+      fieldErrors: { name: "Contains an invalid character." },
+      values: { name: "Init\u0000ech", website: "" },
+    });
+    expect((await companyRow(company.id)).name).toBe("Before Co");
+    expect(mocks.revalidatePath).not.toHaveBeenCalled();
+  });
+});
+
 describe("updateRetentionAction", () => {
   it("requires a signed-in employer", async () => {
     await expect(updateRetentionAction({}, form({ retentionDays: "30" }))).rejects.toThrow("REDIRECT:/login");

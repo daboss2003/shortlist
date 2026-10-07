@@ -73,6 +73,14 @@ describe("loginAction", () => {
     expect(authenticate).not.toHaveBeenCalled();
   });
 
+  it("answers an email with a NUL character as incorrect, before any limiter or query", async () => {
+    const user = await makeUser();
+    expect(await login(`${user.email}\u0000`, PASSWORD)).toEqual({ error: "Incorrect email or password." });
+    expect(peek).not.toHaveBeenCalled();
+    expect(hit).not.toHaveBeenCalled();
+    expect(authenticate).not.toHaveBeenCalled();
+  });
+
   it("logs in with the right password", async () => {
     const user = await makeUser();
     expect(await login(` ${user.email.toUpperCase()} `, PASSWORD)).toEqual(LOGGED_IN);
@@ -177,6 +185,11 @@ describe("signupAction", () => {
       formError: "This invite link is invalid or has expired. Ask for a new one.",
       values: { companyName: "Acme Logistics", website: "", name: "Jane Doe", email: "jane@acme.com", password: "" },
     });
+  });
+
+  it("returns a field error for a NUL character instead of throwing", async () => {
+    const result = await signup(await signupForm({ name: "Jane\u0000Doe" }));
+    expect(result).toMatchObject({ fieldErrors: { name: "Contains an invalid character." }, values: { name: "Jane\u0000Doe" } });
   });
 
   it("limits signups per trusted IP, ignoring spoofed X-Forwarded-For entries", async () => {

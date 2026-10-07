@@ -30,14 +30,17 @@ function exportRequest(jobId: string, query: string) {
   });
 }
 
-function postExport(jobId: string, fields: Record<string, string>, origin = "http://localhost") {
+function postExport(jobId: string, fields: Record<string, string>, origin = "http://localhost", query = "") {
   const body = new FormData();
   for (const [key, value] of Object.entries(fields)) body.append(key, value);
   return POST(
-    new Request(`http://localhost/api/jobs/${jobId}/export`, { method: "POST", body, headers: { origin, host: "localhost" } }),
+    new Request(`http://localhost/api/jobs/${jobId}/export${query}`, { method: "POST", body, headers: { origin, host: "localhost" } }),
     { params: Promise.resolve({ jobId }) },
   );
 }
+
+/** A ZIP's spreadsheet request: a POST pinned to the manifest's ids (see zip-export.ts). */
+const postZipSheet = (jobId: string, fields: Record<string, string>) => postExport(jobId, fields, "http://localhost", "?for=zip");
 
 const randomIds = (n: number) => Array.from({ length: n }, () => crypto.randomUUID());
 
@@ -389,5 +392,56 @@ describe("POST /api/jobs/[jobId]/export", () => {
     const res = await postExport(job.id, { format: "csv", ids: randomIds(2000).join(",") });
     expect(res.status).toBe(413);
     expect(await res.json()).toEqual({ error: expect.any(String) });
+  });
+});
+
+describe("POST /api/jobs/[jobId]/export?for=zip (a ZIP's spreadsheets)", () => {
+  it("leaves out a candidate added after the manifest, with the manifest's ranks", async () => {
+    const { job } = await setup();
+    const manifest = (await (await exportRequest(job.id, "format=manifest")).json()) as ZipManifest;
+    await addCandidate(job, "Arrived Late");
+
+    const res = await postZipSheet(job.id, { format: "csv", ids: manifest.candidates.map((c) => c.id).join(",") });
+    expect(res.status).toBe(200);
+    expect(await csvRankedNames(res)).toEqual(manifest.candidates.map((c) => [c.rank === null ? "" : String(c.rank), c.name]));
+    expect(await csvNames(await exportRequest(job.id, "format=csv"))).toContain("Arrived Late");
+  });
+
+  it("accepts as many ids as a ZIP can hold (5000), honouring the stage", async () => {
+    const { job, low, high, mid } = await setup();
+    const ids = [...randomIds(4997), low.id, high.id, mid.id].join(",");
+    const res = await postZipSheet(job.id, { format: "xlsx", stage: "shortlisted", ids });
+    expect(res.status).toBe(200);
+    const wb = new Workbook();
+    await wb.xlsx.load((await res.arrayBuffer()) as never);
+    expect(wb.worksheets[0].getCell("B2").value).toBe("High Score");
+    expect(wb.worksheets[0].getCell("B3").value).toBe("Mid Score");
+    expect(wb.worksheets[0].rowCount).toBe(3);
+  });
+
+  it("rejects more than 5000 ids, and a body over 256 KB", async () => {
+    const { job, high } = await setup();
+    const tooMany = await postZipSheet(job.id, { format: "csv", ids: [...randomIds(5000), high.id].join(",") });
+    expect(tooMany.status).toBe(400);
+    expect(await tooMany.json()).toEqual({ error: "You can export at most 5000 selected candidates." });
+
+    const tooBig = await postZipSheet(job.id, { format: "csv", ids: randomIds(7500).join(",") });
+    expect(tooBig.status).toBe(413);
+  });
+
+  it("is still cookie-auth, same-origin and tenant-scoped", async () => {
+    const { job, high } = await setup();
+    expect((await postExport(job.id, { format: "csv", ids: high.id }, "https://evil.example", "?for=zip")).status).toBe(403);
+    signInAs((await makeCompany()).company);
+    expect((await postZipSheet(job.id, { format: "csv", ids: high.id })).status).toBe(404);
+    signInAs(null);
+    expect((await postZipSheet(job.id, { format: "csv", ids: high.id })).status).toBe(401);
+  });
+
+  it("keeps a selection's 1000-id cap without the parameter", async () => {
+    const { job, high } = await setup();
+    const res = await postExport(job.id, { format: "csv", ids: [...randomIds(1000), high.id].join(",") }, "http://localhost", "?for=other");
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "You can export at most 1000 selected candidates." });
   });
 });

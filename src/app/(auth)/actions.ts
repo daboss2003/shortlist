@@ -6,6 +6,7 @@ import { authenticate, registerCompany, type SignupField, type SignupFieldErrors
 import { endSession, startSession } from "@/lib/auth/session";
 import { clientIpFromHeaders } from "@/lib/http";
 import { hit, peek, rateLimit, refund } from "@/lib/rate-limit";
+import { hasNul } from "@/lib/validation";
 
 export type SignupState = {
   fieldErrors?: SignupFieldErrors;
@@ -59,8 +60,11 @@ export async function signupAction(_prev: SignupState, formData: FormData): Prom
 export async function loginAction(_prev: LoginState, formData: FormData): Promise<LoginState> {
   const rawEmail = text(formData, "email");
   const password = text(formData, "password");
-  // Before any limiter: over-long input can't match an account, and must never become a limiter key.
-  if (rawEmail.length > MAX_CREDENTIAL_LENGTH || password.length > MAX_CREDENTIAL_LENGTH) return { error: INCORRECT };
+  // Before any limiter: over-long input can't match an account, and must never become a limiter key. Nor can an
+  // email with NUL (signup rejects it), which Postgres would refuse to compare.
+  if (rawEmail.length > MAX_CREDENTIAL_LENGTH || password.length > MAX_CREDENTIAL_LENGTH || hasNul(rawEmail)) {
+    return { error: INCORRECT };
+  }
 
   const email = rawEmail.trim().toLowerCase();
   if (!email || !password) return { error: "Enter your email and password.", email };

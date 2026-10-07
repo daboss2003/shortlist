@@ -2,6 +2,7 @@ import "server-only";
 import { and, asc, eq, getTableColumns, sql, type SQL } from "drizzle-orm";
 import { db } from "@/db";
 import { candidates, jobs, type Candidate, type CandidateStage, type Job } from "@/db/schema";
+import { isLookupSafe } from "./jobs";
 
 // Tenant-scoped by companyId. Same Cache Components rule as data/jobs.ts.
 
@@ -29,6 +30,7 @@ export async function listCandidatesForJob(
   jobId: string,
   opts: CandidateListOptions = {},
 ): Promise<RankedCandidate[]> {
+  if (!isLookupSafe(jobId)) return [];
   const where: SQL[] = [eq(candidates.companyId, companyId), eq(candidates.jobId, jobId)];
   if (opts.stage) where.push(eq(candidates.stage, opts.stage));
   const rows = await db
@@ -47,6 +49,7 @@ export async function listCandidatesForJob(
 export type CandidateWithJob = Candidate & { job: Job };
 
 export async function getCandidateForCompany(companyId: string, candidateId: string): Promise<CandidateWithJob | null> {
+  if (!isLookupSafe(candidateId)) return null;
   const [row] = await db
     .select({ candidate: candidates, job: jobs })
     .from(candidates)

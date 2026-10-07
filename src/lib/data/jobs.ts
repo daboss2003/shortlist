@@ -33,7 +33,14 @@ export async function listJobsWithStats(companyId: string): Promise<JobWithStats
   return rows.map(({ job, ...stats }) => ({ ...job, ...stats }));
 }
 
+/**
+ * Ids and slugs come from URLs. Postgres rejects NUL in text (error 22021), so a hostile value would surface as a
+ * 500; a malformed id must behave like a missing one.
+ */
+export const isLookupSafe = (value: string) => value.length > 0 && value.length <= 200 && !value.includes("\u0000");
+
 export async function getJobForCompany(companyId: string, jobId: string): Promise<Job | null> {
+  if (!isLookupSafe(jobId)) return null;
   const [job] = await db
     .select()
     .from(jobs)
@@ -51,6 +58,7 @@ export type PublicJob = Job & {
 
 /** Public apply page lookup. Returns closed jobs too so the page can say the role is closed. */
 export async function getPublicJobBySlug(slug: string): Promise<PublicJob | null> {
+  if (!isLookupSafe(slug)) return null;
   const [row] = await db
     .select({
       job: jobs,

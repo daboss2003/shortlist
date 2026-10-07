@@ -3,14 +3,14 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { companies, users } from "@/db/schema";
+import { hasNul, safeText } from "@/lib/validation";
 import { INVITE_ERROR, findUsableInvite, redeemInvite } from "./invites";
 import { hashPassword, verifyPassword } from "./password";
 
 const WEBSITE_ERROR = "Enter a valid website, like acme.com.";
 
 /** "acme.com" → "https://acme.com". Only http(s) on a dotted host, no credentials. Empty → null. */
-export const websiteSchema = z
-  .string()
+export const websiteSchema = safeText()
   .trim()
   .optional()
   .transform((value, ctx) => {
@@ -41,8 +41,7 @@ export const websiteSchema = z
     return normalized;
   });
 
-export const companyNameSchema = z
-  .string()
+export const companyNameSchema = safeText()
   .trim()
   .min(1, "Enter your company name.")
   .min(2, "Company name must be at least 2 characters.")
@@ -51,14 +50,14 @@ export const companyNameSchema = z
 export const signupSchema = z.object({
   companyName: companyNameSchema,
   website: websiteSchema,
-  name: z.string().trim().min(1, "Enter your name.").max(120, "Keep your name under 120 characters."),
-  email: z
-    .string()
+  name: safeText().trim().min(1, "Enter your name.").max(120, "Keep your name under 120 characters."),
+  email: safeText()
     .trim()
     .toLowerCase()
     .min(1, "Enter your work email.")
     .max(200, "Keep the email under 200 characters.")
     .pipe(z.email("Enter a valid email address.")),
+  // Intentional: z.string(), not safeText() — the password is only ever hashed, never stored or queried as text.
   password: z.string().min(8, "Use at least 8 characters.").max(200, "Use 200 characters or fewer."),
 });
 
@@ -127,7 +126,8 @@ export async function registerCompany(input: unknown, inviteToken: unknown): Pro
 /** Whether an account already uses this email (any casing). */
 export async function accountExists(email: string): Promise<boolean> {
   const normalized = email.trim().toLowerCase();
-  if (!normalized) return false;
+  // No stored email can contain NUL (signup rejects it), and Postgres would refuse the query.
+  if (!normalized || hasNul(normalized)) return false;
   const [user] = await db.select({ id: users.id }).from(users).where(eq(users.email, normalized)).limit(1);
   return !!user;
 }
@@ -139,7 +139,8 @@ const DUMMY_PASSWORD_HASH =
 /** Returns the user id when the email + password match, else null. */
 export async function authenticate(email: string, password: string): Promise<string | null> {
   const normalized = email.trim().toLowerCase();
-  const [user] = normalized
+  // An email with NUL can't match an account (signup rejects it), and Postgres would refuse the query.
+  const [user] = normalized && !hasNul(normalized)
     ? await db
         .select({ id: users.id, passwordHash: users.passwordHash })
         .from(users)

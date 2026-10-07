@@ -5,7 +5,13 @@ import { redirect } from "next/navigation";
 import { z } from "zod";
 import { CANDIDATE_STAGES, type CandidateStage } from "@/db/schema";
 import { requireEmployer } from "@/lib/auth/dal";
-import { deleteCandidate, deleteCandidates, markForRescore, setCandidatesStage } from "@/lib/candidates/review";
+import {
+  CandidateDeleteIncompleteError,
+  deleteCandidate,
+  deleteCandidates,
+  markForRescore,
+  setCandidatesStage,
+} from "@/lib/candidates/review";
 import { scheduleCandidateProcessing } from "@/lib/pipeline";
 
 export type ReviewActionResult = { ok: true; count: number } | { ok: false; error: string };
@@ -52,9 +58,16 @@ export async function deleteCandidatesAction(jobId: string, ids: string[]): Prom
   const input = bulkDeleteInput.safeParse({ jobId, ids });
   if (!input.success) return INVALID;
 
-  const count = await deleteCandidates(employer.companyId, input.data.jobId, input.data.ids);
-  refresh();
-  return { ok: true, count };
+  try {
+    const count = await deleteCandidates(employer.companyId, input.data.jobId, input.data.ids);
+    refresh();
+    return { ok: true, count };
+  } catch (err) {
+    if (!(err instanceof CandidateDeleteIncompleteError)) throw err;
+    // Some CV files couldn't be removed in time: those candidates are kept (never orphaned), the rest are gone.
+    refresh();
+    return { ok: false, error: err.message };
+  }
 }
 
 /** Deletes the candidate and their CV, then redirects to the job page. */
@@ -63,7 +76,13 @@ export async function deleteCandidateAction(jobId: string, candidateId: string):
   const input = deleteInput.safeParse({ jobId, candidateId });
   if (!input.success) return INVALID;
 
-  const deleted = await deleteCandidate(employer.companyId, input.data.candidateId);
+  let deleted: boolean;
+  try {
+    deleted = await deleteCandidate(employer.companyId, input.data.candidateId);
+  } catch (err) {
+    if (!(err instanceof CandidateDeleteIncompleteError)) throw err;
+    return { ok: false, error: err.message };
+  }
   if (!deleted) return { ok: false, error: "This candidate no longer exists." };
   redirect(`/dashboard/jobs/${input.data.jobId}`);
 }

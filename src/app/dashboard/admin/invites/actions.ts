@@ -5,6 +5,7 @@ import { z } from "zod";
 import { accountExists } from "@/lib/auth/accounts";
 import { requirePlatformAdmin } from "@/lib/auth/dal";
 import { createInvite, revokeInvite } from "@/lib/auth/invites";
+import { safeText } from "@/lib/validation";
 import { INVITE_DAY_CHOICES } from "./invite-options";
 
 // Platform-admin only: every action re-checks requirePlatformAdmin() (non-admins get a 404).
@@ -20,8 +21,7 @@ export type CreateInviteState = {
 };
 
 const createInviteSchema = z.object({
-  email: z
-    .string()
+  email: safeText()
     .trim()
     .toLowerCase()
     .max(200, "Keep the email under 200 characters.")

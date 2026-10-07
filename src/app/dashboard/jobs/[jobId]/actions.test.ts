@@ -15,7 +15,20 @@ const mocks = vi.hoisted(() => ({
   redirect: vi.fn((url: string) => {
     throw new Error(`REDIRECT:${url}`);
   }),
+  // Passes through to the real storage unless a test makes one key fail.
+  failDeleteFor: null as string | null,
 }));
+
+vi.mock("@/lib/storage", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/storage")>();
+  return {
+    ...real,
+    deleteCvFile: async (key: string) => {
+      if (key === mocks.failDeleteFor) throw new Error("blob store unavailable");
+      return real.deleteCvFile(key);
+    },
+  };
+});
 
 vi.mock("@/lib/auth/dal", () => ({
   requireEmployer: async () => {
@@ -55,6 +68,7 @@ const row = async (id: string) => (await db.select().from(candidates).where(eq(c
 
 beforeEach(() => {
   mocks.employer = null;
+  mocks.failDeleteFor = null;
   mocks.schedule.mockReset();
   mocks.refresh.mockReset();
   mocks.redirect.mockClear();
@@ -152,6 +166,22 @@ describe("deleteCandidatesAction", () => {
     expect(await deleteCandidatesAction(job.id, tooMany)).toMatchObject({ ok: false });
     expect(await row(mine.id)).toBeDefined();
     expect(mocks.refresh).not.toHaveBeenCalled();
+  });
+});
+
+describe("partial deletes", () => {
+  it("reports how many were deleted and keeps the candidate whose CV file couldn't be removed", async () => {
+    const { job, mine } = await setup();
+    const cv2 = await validateCvUpload(new File([new Uint8Array(Buffer.from("%PDF-1.4\n% second\n"))], "b.pdf"));
+    const second = await createCandidateFromCv({ job, source: "upload", cv: cv2 });
+    mocks.failDeleteFor = mine.cvFileKey;
+
+    const result = await deleteCandidatesAction(job.id, [mine.id, second.id]);
+    expect(result).toMatchObject({ ok: false });
+    expect(result.ok === false && result.error).toMatch(/1 of 2/);
+    expect(await row(mine.id)).toBeDefined();
+    expect(await row(second.id)).toBeUndefined();
+    expect(mocks.refresh).toHaveBeenCalled();
   });
 });
 

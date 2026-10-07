@@ -134,6 +134,19 @@ describe("POST /api/apply/[slug]", () => {
     expect(fieldErrors.cv).toBe("Please attach your CV.");
   });
 
+  it("400: a NUL character in a text field is a field error, not a failed insert (500)", async () => {
+    const job = await openJob();
+    const filesBefore = storedFiles();
+    for (const field of ["name", "email", "phone"] as const) {
+      const res = await apply(job.slug, formData({ [field]: `${field === "email" ? "jane@example.com" : "Jane"}\u0000x` }));
+      expect(res.status, field).toBe(400);
+      expect((await res.json()).fieldErrors, field).toEqual({ [field]: "Contains an invalid character." });
+    }
+    expect(await rowsFor(job.id)).toHaveLength(0);
+    expect(storedFiles()).toEqual(filesBefore);
+    expect(scheduleSpy).not.toHaveBeenCalled();
+  });
+
   it("400: reports a file whose bytes aren't a supported CV under fieldErrors.cv", async () => {
     const job = await openJob();
     const res = await apply(job.slug, formData({ cv: pdfFile(Buffer.from("MZ\x90\x00 not a pdf"), "cv.pdf") }));

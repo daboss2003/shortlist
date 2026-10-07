@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isNetlify } from "@/lib/pipeline/runtime";
 
 export function jsonError(status: number, error: string) {
   return NextResponse.json({ error }, { status });
@@ -36,7 +37,8 @@ const MAX_IP_LENGTH = 64;
  */
 export function clientIpFromHeaders(headers: Pick<Headers, "get">): string {
   // Only trusted when actually running on Netlify; behind any other proxy a client could send this header itself.
-  const netlifyIp = process.env.NETLIFY === "true" ? headers.get("x-nf-client-connection-ip")?.trim() : undefined;
+  // isNetlify(), not NETLIFY=true alone: Netlify sets that env var at build time but not inside functions.
+  const netlifyIp = isNetlify() ? headers.get("x-nf-client-connection-ip")?.trim() : undefined;
   if (netlifyIp) return netlifyIp.slice(0, MAX_IP_LENGTH);
 
   const entries = (headers.get("x-forwarded-for") ?? "")
