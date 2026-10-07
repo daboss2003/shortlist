@@ -40,7 +40,8 @@ Icons: `lucide-react` only, `size-4` inline (buttons size them automatically), `
 ## Patterns
 
 - **Tables** for candidate lists (dense rows, `text-sm`, sticky-ish header in `bg-subtle`, row hover `hover:bg-subtle/60`),
-  wrapped in `overflow-x-auto` so the page never scrolls horizontally at 375px.
+  wrapped in `relative overflow-x-auto` so the page never scrolls horizontally at 375px (`relative` is required:
+  without it, absolutely positioned descendants such as `sr-only` labels escape the scroll box and widen the page).
 - **Score**: integer 0–100 in a pill coloured by `scoreTone` (≥75 success, 50–74 warning, <50 danger), `tabular-nums`.
   Pending/processing shows a spinner + "Analyzing", failed shows danger badge "Failed" with the error on hover/detail.
 - **Every screen** ships loading (Suspense `LoadingBlock`), empty (`EmptyState` with a CTA), error (`Alert tone="danger"` with retry
