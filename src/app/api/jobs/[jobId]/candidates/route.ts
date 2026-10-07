@@ -5,27 +5,28 @@ import { MAX_CV_BYTES } from "@/lib/cv/file-type";
 import { getJobForCompany } from "@/lib/data/jobs";
 import { isSameOrigin, jsonError } from "@/lib/http";
 import { scheduleCandidateProcessing } from "@/lib/pipeline";
+import { describeError } from "@/lib/log";
 
-// The client sends larger selections in batches of this size.
-const MAX_UPLOAD_FILES = 10;
-// Intentional: 1 MB on top of the files themselves for multipart boundaries and part headers.
-const MAX_UPLOAD_BODY_BYTES = MAX_UPLOAD_FILES * MAX_CV_BYTES + 1024 * 1024;
+// Intentional: one CV per request, with 256 KB on top for the multipart boundary and part headers. Netlify
+// Functions accept ~4.5 MB of binary per request, so a batch is sent by the client as one request per file.
+const MAX_UPLOAD_BODY_BYTES = MAX_CV_BYTES + 256 * 1024;
 const MAX_CV_MB = MAX_CV_BYTES / (1024 * 1024);
 
 export type UploadResult =
   | { fileName: string; ok: true; candidateId: string }
   | { fileName: string; ok: false; error: string; code?: "duplicate" };
 
+/** `results` always holds exactly one entry: the result for the request's single file. */
 export type UploadResponse = { results: UploadResult[]; created: number };
 
-/** Employer bulk upload of CVs they already hold. Closed jobs take no new CVs; identical files are skipped. */
+/** Employer upload of one CV they already hold. Closed jobs take no new CVs; identical files are skipped. */
 export async function POST(request: Request, ctx: RouteContext<"/api/jobs/[jobId]/candidates">) {
   const employer = await getCurrentEmployer();
   if (!employer) return jsonError(401, "Your session has expired. Sign in again.");
   if (!isSameOrigin(request)) return jsonError(403, "Cross-origin request blocked.");
 
   const { jobId } = await ctx.params;
-  const job = getJobForCompany(employer.companyId, jobId);
+  const job = await getJobForCompany(employer.companyId, jobId);
   if (!job) return jsonError(404, "Job not found.");
   if (job.status === "closed") return jsonError(409, "This job is closed. Reopen it to add CVs.");
 
@@ -33,45 +34,39 @@ export async function POST(request: Request, ctx: RouteContext<"/api/jobs/[jobId
   try {
     form = await readFormDataWithLimit(request, MAX_UPLOAD_BODY_BYTES);
   } catch (err) {
-    if (err instanceof BodyTooLargeError) {
-      return jsonError(413, `Upload at most ${MAX_UPLOAD_FILES} CVs (${MAX_CV_MB} MB each) at a time.`);
-    }
-    return jsonError(400, "Couldn't read the upload. Try again with fewer files.");
+    if (err instanceof BodyTooLargeError) return jsonError(413, `That CV is larger than ${MAX_CV_MB} MB.`);
+    return jsonError(400, "Couldn't read the upload. Try again.");
   }
   const files = form.getAll("files").filter((value): value is File => typeof value !== "string");
-  if (files.length === 0) return jsonError(400, "Choose at least one CV to upload.");
-  if (files.length > MAX_UPLOAD_FILES) return jsonError(400, `Upload at most ${MAX_UPLOAD_FILES} CVs at a time.`);
+  if (files.length === 0) return jsonError(400, "Choose a CV to upload.");
+  if (files.length > 1) return jsonError(400, "Upload one CV per request.");
 
-  const results: UploadResult[] = [];
-  // Intentional: sequential, not Promise.all — keeps result order, bounds memory/disk I/O per request, and lets a
-  // second identical file in the same request hit the duplicate check.
-  for (const file of files) {
-    const fallbackName = file.name || "cv";
+  const result = await storeUpload(job, files[0]);
+  if (result.ok) {
     try {
-      const cv = await validateCvUpload(file);
-      const candidate = await createCandidateFromCv({ job, source: "upload", cv });
-      results.push({ fileName: cv.fileName, ok: true, candidateId: candidate.id });
+      await scheduleCandidateProcessing([result.candidateId]);
     } catch (err) {
-      if (err instanceof DuplicateCvError) {
-        results.push({ fileName: fallbackName, ok: false, code: "duplicate", error: "Already in this job." });
-        continue;
-      }
-      if (!(err instanceof CvValidationError)) console.error("Employer CV upload failed", err);
-      const error = err instanceof CvValidationError ? err.message : "Couldn't save this file.";
-      results.push({ fileName: fallbackName, ok: false, error });
+      // Intentional: the CV is already saved as "pending", which the pipeline's periodic re-queue picks up; a 500
+      // here would stop the client's batch and report a stored CV as not uploaded.
+      console.error("Couldn't schedule an uploaded CV for processing:", describeError(err));
     }
   }
 
-  const createdIds = results.flatMap((r) => (r.ok ? [r.candidateId] : []));
-  if (createdIds.length > 0) {
-    try {
-      scheduleCandidateProcessing(createdIds);
-    } catch (err) {
-      // Intentional: the CVs are saved as "pending" and get re-queued on the next server boot; a 500
-      // here would make the client retry and create duplicate candidates.
-      console.error("Couldn't schedule uploaded CVs for processing", err);
-    }
-  }
+  return Response.json({ results: [result], created: result.ok ? 1 : 0 } satisfies UploadResponse);
+}
 
-  return Response.json({ results, created: createdIds.length } satisfies UploadResponse);
+async function storeUpload(job: { id: string; companyId: string }, file: File): Promise<UploadResult> {
+  const fallbackName = file.name || "cv";
+  try {
+    const cv = await validateCvUpload(file);
+    const candidate = await createCandidateFromCv({ job, source: "upload", cv });
+    return { fileName: cv.fileName, ok: true, candidateId: candidate.id };
+  } catch (err) {
+    if (err instanceof DuplicateCvError) {
+      return { fileName: fallbackName, ok: false, code: "duplicate", error: "Already in this job." };
+    }
+    if (!(err instanceof CvValidationError)) console.error("Employer CV upload failed:", describeError(err, { withStack: true }));
+    const error = err instanceof CvValidationError ? err.message : "Couldn't save this file.";
+    return { fileName: fallbackName, ok: false, error };
+  }
 }

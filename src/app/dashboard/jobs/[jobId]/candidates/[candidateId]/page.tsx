@@ -21,7 +21,7 @@ type Props = PageProps<"/dashboard/jobs/[jobId]/candidates/[candidateId]">;
 
 export async function generateMetadata(props: Props): Promise<Metadata> {
   const [{ jobId, candidateId }, employer] = await Promise.all([props.params, getCurrentEmployer()]);
-  const candidate = employer ? getCandidateForCompany(employer.companyId, candidateId) : null;
+  const candidate = employer ? await getCandidateForCompany(employer.companyId, candidateId) : null;
   return { title: candidate && candidate.jobId === jobId ? candidateDisplayName(candidate) : "Candidate" };
 }
 
@@ -36,7 +36,7 @@ export default function Page(props: Props) {
 async function CandidateDetail({ params }: Props) {
   const employer = await requireEmployer();
   const { jobId, candidateId } = await params;
-  const candidate = getCandidateForCompany(employer.companyId, candidateId);
+  const candidate = await getCandidateForCompany(employer.companyId, candidateId);
   if (!candidate || candidate.jobId !== jobId) notFound();
 
   const { job, profile, evaluation, status } = candidate;

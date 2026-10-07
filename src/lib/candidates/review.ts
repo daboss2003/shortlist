@@ -8,20 +8,26 @@ import { deleteCvFile } from "@/lib/storage";
 // foreign ids are silently ignored. Callers authenticate and validate input first.
 
 /** Moves candidates of one job to a review stage. Returns the number of rows updated. */
-export function setCandidatesStage(companyId: string, jobId: string, ids: string[], stage: CandidateStage): number {
+export async function setCandidatesStage(
+  companyId: string,
+  jobId: string,
+  ids: string[],
+  stage: CandidateStage,
+): Promise<number> {
   if (ids.length === 0) return 0;
-  return db
+  const rows = await db
     .update(candidates)
     .set({ stage })
     .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, jobId), inArray(candidates.id, ids)))
-    .run().changes;
+    .returning({ id: candidates.id });
+  return rows.length;
 }
 
 /**
  * Re-queues candidates for AI analysis: status → pending, error cleared, attempts reset.
  * Returns the ids to pass to scheduleCandidateProcessing().
  */
-export function markForRescore(companyId: string, jobId: string, ids: string[] | "all"): string[] {
+export async function markForRescore(companyId: string, jobId: string, ids: string[] | "all"): Promise<string[]> {
   if (ids !== "all" && ids.length === 0) return [];
   const where: SQL[] = [eq(candidates.companyId, companyId), eq(candidates.jobId, jobId)];
   if (ids !== "all") where.push(inArray(candidates.id, ids));
@@ -29,22 +35,20 @@ export function markForRescore(companyId: string, jobId: string, ids: string[] |
   // description; the pipeline sees the row went back to "pending", discards the superseded result and
   // runs it again. cvText, profile, evaluation and score are kept — the pipeline skips re-extraction
   // when cvText exists, and the stale ranking stays visible until the new one lands.
-  return db
+  const rows = await db
     .update(candidates)
     .set({ status: "pending", error: null, attempts: 0 })
     .where(and(...where))
-    .returning({ id: candidates.id })
-    .all()
-    .map((row) => row.id);
+    .returning({ id: candidates.id });
+  return rows.map((row) => row.id);
 }
 
 /** Deletes the candidate row, then its stored CV. Returns false for a missing or foreign id. */
 export async function deleteCandidate(companyId: string, candidateId: string): Promise<boolean> {
-  const row = db
+  const [row] = await db
     .delete(candidates)
     .where(and(eq(candidates.id, candidateId), eq(candidates.companyId, companyId)))
-    .returning({ cvFileKey: candidates.cvFileKey })
-    .get();
+    .returning({ cvFileKey: candidates.cvFileKey });
   if (!row) return false;
   await deleteCvFile(row.cvFileKey);
   return true;
@@ -53,11 +57,10 @@ export async function deleteCandidate(companyId: string, candidateId: string): P
 /** Deletes candidates of one job, then their stored CVs. Returns the number of candidates deleted. */
 export async function deleteCandidates(companyId: string, jobId: string, ids: string[]): Promise<number> {
   if (ids.length === 0) return 0;
-  const rows = db
+  const rows = await db
     .delete(candidates)
     .where(and(eq(candidates.companyId, companyId), eq(candidates.jobId, jobId), inArray(candidates.id, ids)))
-    .returning({ cvFileKey: candidates.cvFileKey })
-    .all();
+    .returning({ cvFileKey: candidates.cvFileKey });
   for (const { cvFileKey } of rows) {
     try {
       await deleteCvFile(cvFileKey);

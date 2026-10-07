@@ -12,13 +12,15 @@ import { getPublicJobBySlug } from "@/lib/data/jobs";
 import { clientIp, jsonError } from "@/lib/http";
 import { scheduleCandidateProcessing } from "@/lib/pipeline";
 import { rateLimit } from "@/lib/rate-limit";
+import { describeError } from "@/lib/log";
 
 type ApplyField = "name" | "email" | "phone" | "cv" | "consent";
 type FieldErrors = Partial<Record<ApplyField, string>>;
 
 const MAX_MB = MAX_CV_BYTES / (1024 * 1024);
-// Headroom for the text fields and multipart boundaries on top of the CV itself.
-const MAX_BODY_BYTES = MAX_CV_BYTES + 1024 * 1024;
+// Intentional: only 256 KB on top of the CV (the text fields and multipart boundaries are a few KB). Netlify
+// Functions accept ~4.5 MB of binary per request, so the cap must stay just above MAX_CV_BYTES.
+const MAX_BODY_BYTES = MAX_CV_BYTES + 256 * 1024;
 const PHONE_PATTERN = /^[0-9 +\-().]*$/;
 
 const MESSAGES = {
@@ -72,11 +74,11 @@ function tooManyRequests(retryAfterSec: number) {
 // Intentional: public because applicants have no account — protected by rate limit, honeypot and strict validation.
 export async function POST(request: Request, ctx: RouteContext<"/api/apply/[slug]">) {
   try {
-    const perIp = rateLimit(`apply:${clientIp(request)}`, 5, 600_000);
+    const perIp = await rateLimit(`apply:${clientIp(request)}`, 5, 600_000);
     if (!perIp.ok) return tooManyRequests(perIp.retryAfterSec);
 
     const { slug } = await ctx.params;
-    const job = getPublicJobBySlug(slug);
+    const job = await getPublicJobBySlug(slug);
     if (!job) return jsonError(404, "This job link is invalid.");
     if (job.status !== "open") return jsonError(410, "This role is no longer accepting applications.");
 
@@ -129,7 +131,7 @@ export async function POST(request: Request, ctx: RouteContext<"/api/apply/[slug
     if (!parsed.success || !cv || Object.keys(fieldErrors).length > 0) return fieldErrorResponse(fieldErrors);
 
     // Counted only for valid submissions: this cap exists to bound AI spend per job, not to punish typos.
-    const perJob = rateLimit(`apply-job:${slug}`, 300, 3_600_000);
+    const perJob = await rateLimit(`apply-job:${slug}`, 300, 3_600_000);
     if (!perJob.ok) return tooManyRequests(perJob.retryAfterSec);
 
     const { name, email, phone } = parsed.data;
@@ -148,16 +150,17 @@ export async function POST(request: Request, ctx: RouteContext<"/api/apply/[slug
     }
 
     try {
-      scheduleCandidateProcessing([candidateId]);
+      await scheduleCandidateProcessing([candidateId]);
     } catch (err) {
-      // Intentional: the application is already stored as "pending" and recoverInterruptedCandidates() re-queues
-      // it on the next boot; a 500 here would make the applicant retry and hit the duplicate-application 409.
-      console.error("Failed to schedule CV processing", err);
+      // Intentional: the application is already stored as "pending", which the pipeline's periodic re-queue picks
+      // up; a 500 here would make the applicant retry and hit the duplicate-application 409.
+      console.error("Failed to schedule CV processing:", describeError(err));
     }
 
     return NextResponse.json({ ok: true }, { status: 201 });
   } catch (err) {
-    console.error("Public application failed", err);
+    // Intentional: describeError, never the raw error — Drizzle errors embed query params (the applicant's details).
+    console.error("Public application failed:", describeError(err, { withStack: true }));
     return jsonError(500, "Something went wrong. Please try again.");
   }
 }

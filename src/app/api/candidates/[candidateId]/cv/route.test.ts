@@ -25,8 +25,8 @@ const employerFor = (companyId: string): Employer => ({
 const pdfBytes = Buffer.from("%PDF-1.4\n% downloadable cv\n");
 
 async function makeCandidate(fileName: string) {
-  const { company } = makeCompany();
-  const job = makeJob(company.id);
+  const { company } = await makeCompany();
+  const job = await makeJob(company.id);
   const cv = await validateCvUpload(new File([new Uint8Array(pdfBytes)], fileName, { type: "application/pdf" }));
   const candidate = await createCandidateFromCv({ job, source: "upload", cv });
   return { company, candidate };
@@ -86,7 +86,7 @@ describe("GET /api/candidates/[candidateId]/cv", () => {
 
   it("returns 404 for another company's candidate", async () => {
     const { candidate } = await makeCandidate("cv.pdf");
-    const other = makeCompany();
+    const other = await makeCompany();
     mocks.employer = employerFor(other.company.id);
 
     const res = await download(candidate.id);

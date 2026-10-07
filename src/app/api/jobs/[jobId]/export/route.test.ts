@@ -1,13 +1,12 @@
 import { eq } from "drizzle-orm";
 import { Workbook } from "exceljs";
-import JSZip from "jszip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { db } from "@/db";
 import { candidates, type Candidate, type CandidateStage } from "@/db/schema";
 import { getCurrentEmployer, type Employer } from "@/lib/auth/dal";
 import { createCandidateFromCv, validateCvUpload } from "@/lib/candidates/intake";
 import { makeCompany, makeJob } from "../../../../../../test/factories";
-import { GET, POST } from "./route";
+import { GET, POST, type ZipManifest } from "./route";
 
 vi.mock("@/lib/auth/dal", () => ({ getCurrentEmployer: vi.fn() }));
 
@@ -54,7 +53,7 @@ async function addCandidate(
     cv,
     applicant: { name, email: `${crypto.randomUUID()}@example.com`, phone: null },
   });
-  return db
+  const [row] = await db
     .update(candidates)
     .set({
       score: opts.score ?? null,
@@ -62,8 +61,8 @@ async function addCandidate(
       stage: opts.stage ?? "new",
     })
     .where(eq(candidates.id, created.id))
-    .returning()
-    .get();
+    .returning();
+  return row;
 }
 
 /** [Rank, Name] per CSV row (columns 1–2), header skipped. */
@@ -78,8 +77,8 @@ async function csvNames(res: Response) {
 }
 
 async function setup() {
-  const { company } = makeCompany();
-  const job = makeJob(company.id, { title: "Senior Backend Engineer" });
+  const { company } = await makeCompany();
+  const job = await makeJob(company.id, { title: "Senior Backend Engineer" });
   const low = await addCandidate(job, "Low Score", { score: 40, stage: "rejected" });
   const high = await addCandidate(job, "High Score", { score: 92, stage: "shortlisted" });
   const pending = await addCandidate(job, "Still Pending");
@@ -107,7 +106,7 @@ describe("GET /api/jobs/[jobId]/export", () => {
 
   it("returns 404 for another company's job, exactly like a missing one", async () => {
     const { job } = await setup();
-    const { company: other } = makeCompany();
+    const { company: other } = await makeCompany();
     signInAs(other);
     expect((await exportRequest(job.id, "format=csv")).status).toBe(404);
     expect((await exportRequest(crypto.randomUUID(), "format=csv")).status).toBe(404);
@@ -147,8 +146,8 @@ describe("GET /api/jobs/[jobId]/export", () => {
 
   it("exports only the selected ids, still ranked, silently dropping another company's ids", async () => {
     const { job, low, high } = await setup();
-    const { company: other } = makeCompany();
-    const foreign = await addCandidate(makeJob(other.id), "Foreign Person", { score: 99 });
+    const { company: other } = await makeCompany();
+    const foreign = await addCandidate(await makeJob(other.id), "Foreign Person", { score: 99 });
 
     const res = await exportRequest(job.id, `format=csv&ids=${low.id},${foreign.id},${high.id}`);
     expect(res.status).toBe(200);
@@ -190,8 +189,8 @@ describe("GET /api/jobs/[jobId]/export", () => {
   });
 
   it("returns 400 when there is nothing to export", async () => {
-    const { company } = makeCompany();
-    const job = makeJob(company.id);
+    const { company } = await makeCompany();
+    const job = await makeJob(company.id);
     signInAs(company);
     const res = await exportRequest(job.id, "format=xlsx");
     expect(res.status).toBe(400);
@@ -215,37 +214,86 @@ describe("GET /api/jobs/[jobId]/export", () => {
     expect(sheet.rowCount).toBe(5);
   });
 
-  it("returns a zip of the spreadsheets and the original CVs", async () => {
-    const { job, pending } = await setup();
-    const res = await exportRequest(job.id, "format=zip");
-    expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toBe("application/zip");
-    expect(res.headers.get("content-disposition")).toMatch(/filename="senior-backend-engineer-candidates-2026-10-07\.zip"$/);
-
-    const zip = await JSZip.loadAsync(await res.arrayBuffer());
-    const names = Object.keys(zip.files).filter((n) => !zip.files[n].dir).sort();
-    expect(names).toEqual([
-      "cvs/001-High-Score.pdf",
-      "cvs/002-Mid-Score.pdf",
-      "cvs/003-Low-Score.pdf",
-      `cvs/unranked-${pending.id.slice(0, 8)}-Still-Pending.pdf`,
-      "senior-backend-engineer-candidates-2026-10-07.csv",
-      "senior-backend-engineer-candidates-2026-10-07.xlsx",
-    ]);
-    expect(await zip.file("cvs/001-High-Score.pdf")!.async("string")).toBe("%PDF-1.4 CV of High Score");
+  it("rejects format=zip: the ZIP is built in the browser", async () => {
+    const { job, high } = await setup();
+    for (const query of ["format=zip", `format=zip&ids=${high.id}`, "format=zip&stage=shortlisted"]) {
+      const res = await exportRequest(job.id, query);
+      expect(res.status, query).toBe(400);
+      expect(await res.json()).toEqual({ error: "ZIP exports are built in the browser." });
+    }
   });
 
-  it("names a selected subset's CVs by their on-screen ranks", async () => {
+  it("returns the ZIP manifest: base name and every CV in ranked order", async () => {
+    const { job, low, high, pending, mid } = await setup();
+    const res = await exportRequest(job.id, "format=manifest");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("cache-control")).toBe("private, no-store");
+
+    const manifest = (await res.json()) as ZipManifest;
+    expect(manifest.baseName).toBe("senior-backend-engineer-candidates-2026-10-07");
+    const entry = (c: Candidate, rank: number | null) => ({
+      id: c.id,
+      rank,
+      name: c.name,
+      cvFileName: c.cvFileName,
+      cvExt: "pdf",
+      cvSize: c.cvSize,
+    });
+    expect(manifest.candidates).toEqual([entry(high, 1), entry(mid, 2), entry(low, 3), entry(pending, null)]);
+  });
+
+  it("gives a manifest of a selection the on-screen ranks, the same ones its CSV carries", async () => {
     const { job, low, high } = await setup();
-    const zip = await JSZip.loadAsync(await (await exportRequest(job.id, `format=zip&ids=${low.id},${high.id}`)).arrayBuffer());
-    expect(zip.file(/^cvs\//).map((f) => f.name)).toEqual(["cvs/001-High-Score.pdf", "cvs/003-Low-Score.pdf"]);
+    const { company: other } = await makeCompany();
+    const foreign = await addCandidate(await makeJob(other.id), "Foreign Person", { score: 99 });
+    const ids = `${low.id},${foreign.id},${high.id}`;
+
+    const manifest = (await (await exportRequest(job.id, `format=manifest&ids=${ids}`)).json()) as ZipManifest;
+    expect(manifest.candidates.map((c) => [c.rank, c.name])).toEqual([
+      [1, "High Score"],
+      [3, "Low Score"],
+    ]);
+    expect(await csvRankedNames(await exportRequest(job.id, `format=csv&ids=${ids}`))).toEqual([
+      ["1", "High Score"],
+      ["3", "Low Score"],
+    ]);
+  });
+
+  it("names manifest entries like the export, falling back to the CV's name, then the file name", async () => {
+    const { company } = await makeCompany();
+    const job = await makeJob(company.id);
+    signInAs(company);
+    const cv = await validateCvUpload(new File(["%PDF-1.4 upload"], "Uploaded CV.docx"));
+    const upload = await createCandidateFromCv({ job, source: "upload", cv });
+    const fromProfile = await createCandidateFromCv({
+      job,
+      source: "upload",
+      cv: await validateCvUpload(new File(["%PDF-1.4 profile"], "x.pdf")),
+    });
+    await db
+      .update(candidates)
+      .set({ profile: { fullName: "Ada From CV" } as Candidate["profile"] })
+      .where(eq(candidates.id, fromProfile.id));
+
+    const manifest = (await (await exportRequest(job.id, "format=manifest")).json()) as ZipManifest;
+    const byId = new Map(manifest.candidates.map((c) => [c.id, c]));
+    // The stored type (sniffed from the bytes) decides the extension, not the uploaded name.
+    expect(byId.get(upload.id)).toMatchObject({ name: "Uploaded CV.docx", cvFileName: "Uploaded CV.docx", cvExt: "pdf" });
+    expect(byId.get(fromProfile.id)).toMatchObject({ name: "Ada From CV", cvFileName: "x.pdf" });
+  });
+
+  it("returns 404 for a manifest of another company's job", async () => {
+    const { job } = await setup();
+    signInAs((await makeCompany()).company);
+    expect((await exportRequest(job.id, "format=manifest")).status).toBe(404);
   });
 
   it("slugs awkward job titles into a safe ASCII file name", async () => {
-    const { company } = makeCompany();
+    const { company } = await makeCompany();
     signInAs(company);
     const titled = async (title: string) => {
-      const job = makeJob(company.id, { title });
+      const job = await makeJob(company.id, { title });
       await addCandidate(job, "Someone", { score: 50 });
       const disposition = (await exportRequest(job.id, "format=csv")).headers.get("content-disposition")!;
       return disposition.match(/filename="(.+)"$/)![1];
@@ -274,7 +322,7 @@ describe("POST /api/jobs/[jobId]/export", () => {
 
   it("returns 404 for another company's job", async () => {
     const { job, high } = await setup();
-    signInAs(makeCompany().company);
+    signInAs((await makeCompany()).company);
     expect((await postExport(job.id, { format: "csv", ids: high.id })).status).toBe(404);
   });
 
@@ -302,13 +350,16 @@ describe("POST /api/jobs/[jobId]/export", () => {
     expect(await csvNames(res)).toEqual(["High Score", "Mid Score"]);
   });
 
-  it("returns a streamed zip", async () => {
-    const { job, high } = await setup();
-    const res = await postExport(job.id, { format: "zip", ids: high.id });
+  it("returns the ZIP manifest of the posted selection, and rejects format=zip", async () => {
+    const { job, low, mid, pending } = await setup();
+    const res = await postExport(job.id, { format: "manifest", stage: "shortlisted", ids: `${low.id},${mid.id},${pending.id}` });
     expect(res.status).toBe(200);
-    expect(res.headers.get("content-type")).toBe("application/zip");
-    const zip = await JSZip.loadAsync(await res.arrayBuffer());
-    expect(await zip.file("cvs/001-High-Score.pdf")!.async("string")).toBe("%PDF-1.4 CV of High Score");
+    // Stage ranks: High Score is #1 among the shortlisted, so Mid Score is #2.
+    expect(((await res.json()) as ZipManifest).candidates.map((c) => [c.rank, c.name])).toEqual([[2, "Mid Score"]]);
+
+    const zip = await postExport(job.id, { format: "zip", ids: mid.id });
+    expect(zip.status).toBe(400);
+    expect(await zip.json()).toEqual({ error: "ZIP exports are built in the browser." });
   });
 
   it("rejects bad fields with 400 JSON, including more than 1000 ids", async () => {

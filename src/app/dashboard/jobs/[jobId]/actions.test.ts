@@ -10,7 +10,7 @@ import { makeCompany, makeJob } from "../../../../../test/factories";
 
 const mocks = vi.hoisted(() => ({
   employer: null as Employer | null,
-  schedule: vi.fn(),
+  schedule: vi.fn(async () => {}),
   refresh: vi.fn(),
   redirect: vi.fn((url: string) => {
     throw new Error(`REDIRECT:${url}`);
@@ -40,10 +40,10 @@ const employerFor = (companyId: string): Employer => ({
 });
 
 async function setup() {
-  const a = makeCompany();
-  const b = makeCompany();
-  const job = makeJob(a.company.id);
-  const foreignJob = makeJob(b.company.id);
+  const a = await makeCompany();
+  const b = await makeCompany();
+  const job = await makeJob(a.company.id);
+  const foreignJob = await makeJob(b.company.id);
   const cv = await validateCvUpload(new File([new Uint8Array(Buffer.from("%PDF-1.4\n"))], "cv.pdf"));
   const mine = await createCandidateFromCv({ job, source: "upload", cv });
   const theirs = await createCandidateFromCv({ job: foreignJob, source: "upload", cv });
@@ -51,7 +51,7 @@ async function setup() {
   return { job, foreignJob, mine, theirs };
 }
 
-const row = (id: string) => db.select().from(candidates).where(eq(candidates.id, id)).get();
+const row = async (id: string) => (await db.select().from(candidates).where(eq(candidates.id, id)))[0];
 
 beforeEach(() => {
   mocks.employer = null;
@@ -70,8 +70,8 @@ describe("updateStageAction", () => {
   it("updates own candidates, ignores foreign ids and refreshes", async () => {
     const { job, mine, theirs } = await setup();
     expect(await updateStageAction(job.id, [mine.id, theirs.id], "shortlisted")).toEqual({ ok: true, count: 1 });
-    expect(row(mine.id)?.stage).toBe("shortlisted");
-    expect(row(theirs.id)?.stage).toBe("new");
+    expect((await row(mine.id))?.stage).toBe("shortlisted");
+    expect((await row(theirs.id))?.stage).toBe("new");
     expect(mocks.refresh).toHaveBeenCalledOnce();
   });
 
@@ -82,7 +82,7 @@ describe("updateStageAction", () => {
     expect(await updateStageAction(job.id, [], "rejected")).toMatchObject({ ok: false });
     const tooMany = Array.from({ length: 501 }, () => crypto.randomUUID());
     expect(await updateStageAction(job.id, tooMany, "rejected")).toMatchObject({ ok: false });
-    expect(row(mine.id)?.stage).toBe("new");
+    expect((await row(mine.id))?.stage).toBe("new");
     expect(mocks.refresh).not.toHaveBeenCalled();
   });
 });
@@ -90,12 +90,12 @@ describe("updateStageAction", () => {
 describe("rescoreAction", () => {
   it("re-queues own candidates and schedules exactly those ids", async () => {
     const { job, mine, theirs } = await setup();
-    db.update(candidates).set({ status: "failed", error: "boom" }).run();
+    await db.update(candidates).set({ status: "failed", error: "boom" });
 
     expect(await rescoreAction(job.id, [mine.id, theirs.id])).toEqual({ ok: true, count: 1 });
 
-    expect(row(mine.id)).toMatchObject({ status: "pending", error: null });
-    expect(row(theirs.id)).toMatchObject({ status: "failed", error: "boom" });
+    expect(await row(mine.id)).toMatchObject({ status: "pending", error: null });
+    expect(await row(theirs.id)).toMatchObject({ status: "failed", error: "boom" });
     expect(mocks.schedule).toHaveBeenCalledWith([mine.id]);
     expect(mocks.refresh).toHaveBeenCalledOnce();
   });
@@ -108,10 +108,10 @@ describe("rescoreAction", () => {
 
   it("counts and schedules a candidate that is mid-analysis", async () => {
     const { job, mine } = await setup();
-    db.update(candidates).set({ status: "processing" }).where(eq(candidates.id, mine.id)).run();
+    await db.update(candidates).set({ status: "processing" }).where(eq(candidates.id, mine.id));
 
     expect(await rescoreAction(job.id, "all")).toEqual({ ok: true, count: 1 });
-    expect(row(mine.id)?.status).toBe("pending");
+    expect((await row(mine.id))?.status).toBe("pending");
     expect(mocks.schedule).toHaveBeenCalledWith([mine.id]);
   });
 });
@@ -128,10 +128,10 @@ describe("deleteCandidatesAction", () => {
 
     expect(await deleteCandidatesAction(job.id, [mine.id, second.id, theirs.id])).toEqual({ ok: true, count: 2 });
 
-    expect(row(mine.id)).toBeUndefined();
-    expect(row(second.id)).toBeUndefined();
+    expect(await row(mine.id)).toBeUndefined();
+    expect(await row(second.id)).toBeUndefined();
     expect(fs.existsSync(path.join(process.env.UPLOAD_DIR!, mine.cvFileKey))).toBe(false);
-    expect(row(theirs.id)).toBeDefined();
+    expect(await row(theirs.id)).toBeDefined();
     expect(fs.existsSync(path.join(process.env.UPLOAD_DIR!, theirs.cvFileKey))).toBe(true);
     expect(mocks.refresh).toHaveBeenCalledOnce();
     expect(mocks.redirect).not.toHaveBeenCalled();
@@ -140,7 +140,7 @@ describe("deleteCandidatesAction", () => {
   it("can't reach another company's job", async () => {
     const { foreignJob, theirs } = await setup();
     expect(await deleteCandidatesAction(foreignJob.id, [theirs.id])).toEqual({ ok: true, count: 0 });
-    expect(row(theirs.id)).toBeDefined();
+    expect(await row(theirs.id)).toBeDefined();
   });
 
   it("rejects malformed input without touching the database", async () => {
@@ -150,7 +150,7 @@ describe("deleteCandidatesAction", () => {
     expect(await deleteCandidatesAction("not-a-uuid", [mine.id])).toMatchObject({ ok: false });
     const tooMany = [mine.id, ...Array.from({ length: 500 }, () => crypto.randomUUID())];
     expect(await deleteCandidatesAction(job.id, tooMany)).toMatchObject({ ok: false });
-    expect(row(mine.id)).toBeDefined();
+    expect(await row(mine.id)).toBeDefined();
     expect(mocks.refresh).not.toHaveBeenCalled();
   });
 });
@@ -159,13 +159,13 @@ describe("deleteCandidateAction", () => {
   it("deletes an own candidate and redirects to the job page", async () => {
     const { job, mine } = await setup();
     await expect(deleteCandidateAction(job.id, mine.id)).rejects.toThrow(`REDIRECT:/dashboard/jobs/${job.id}`);
-    expect(row(mine.id)).toBeUndefined();
+    expect(await row(mine.id)).toBeUndefined();
   });
 
   it("leaves another company's candidate untouched", async () => {
     const { job, theirs } = await setup();
     expect(await deleteCandidateAction(job.id, theirs.id)).toMatchObject({ ok: false });
-    expect(row(theirs.id)).toBeDefined();
+    expect(await row(theirs.id)).toBeDefined();
     expect(mocks.redirect).not.toHaveBeenCalled();
   });
 });

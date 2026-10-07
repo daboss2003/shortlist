@@ -8,7 +8,7 @@ import { resetRateLimits } from "@/lib/rate-limit";
 import { makeCompany, makeJob } from "../../../../../test/factories";
 import { POST } from "./route";
 
-const { scheduleSpy } = vi.hoisted(() => ({ scheduleSpy: vi.fn() }));
+const { scheduleSpy } = vi.hoisted(() => ({ scheduleSpy: vi.fn(async () => {}) }));
 vi.mock("@/lib/pipeline", () => ({ scheduleCandidateProcessing: scheduleSpy }));
 
 const pdfBytes = Buffer.from("%PDF-1.4\n% fake but correctly-signed pdf\n");
@@ -67,29 +67,29 @@ async function applyStreamed(slug: string, body: FormData, chunkSize = 64 * 1024
   return { res, bytesRead: pulled, totalBytes: bytes.length };
 }
 
-const rowsFor = (jobId: string) => db.select().from(candidates).where(eq(candidates.jobId, jobId)).all();
+const rowsFor = (jobId: string) => db.select().from(candidates).where(eq(candidates.jobId, jobId));
 const storedFiles = () => fs.readdirSync(process.env.UPLOAD_DIR!).sort();
-const CV_TOO_LARGE = "Your CV is larger than 5 MB. Please upload a smaller file.";
+const CV_TOO_LARGE = "Your CV is larger than 4 MB. Please upload a smaller file.";
 
-function openJob() {
-  const { company } = makeCompany();
+async function openJob() {
+  const { company } = await makeCompany();
   return makeJob(company.id);
 }
 
-beforeEach(() => {
-  resetRateLimits();
+beforeEach(async () => {
+  await resetRateLimits();
   scheduleSpy.mockReset();
 });
 
 describe("POST /api/apply/[slug]", () => {
   it("201: stores a pending public candidate with a normalized email and schedules it", async () => {
-    const job = openJob();
+    const job = await openJob();
     const res = await apply(job.slug, formData());
 
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({ ok: true });
 
-    const rows = rowsFor(job.id);
+    const rows = await rowsFor(job.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       status: "pending",
@@ -104,14 +104,14 @@ describe("POST /api/apply/[slug]", () => {
   });
 
   it("stores an omitted phone as null", async () => {
-    const job = openJob();
+    const job = await openJob();
     const res = await apply(job.slug, formData({ phone: "" }));
     expect(res.status).toBe(201);
-    expect(rowsFor(job.id)[0].phone).toBeNull();
+    expect((await rowsFor(job.id))[0].phone).toBeNull();
   });
 
   it("400: returns field errors for an invalid email and missing consent, and stores nothing", async () => {
-    const job = openJob();
+    const job = await openJob();
     const res = await apply(job.slug, formData({ email: "not-an-email", consent: undefined }));
 
     expect(res.status).toBe(400);
@@ -120,12 +120,12 @@ describe("POST /api/apply/[slug]", () => {
       email: "Please enter a valid email address.",
       consent: "Please confirm you agree to share your CV.",
     });
-    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(await rowsFor(job.id)).toHaveLength(0);
     expect(scheduleSpy).not.toHaveBeenCalled();
   });
 
   it("400: rejects missing name, bad phone and a missing CV together", async () => {
-    const job = openJob();
+    const job = await openJob();
     const res = await apply(job.slug, formData({ name: "   ", phone: "call me maybe", cv: undefined }));
 
     expect(res.status).toBe(400);
@@ -135,17 +135,17 @@ describe("POST /api/apply/[slug]", () => {
   });
 
   it("400: reports a file whose bytes aren't a supported CV under fieldErrors.cv", async () => {
-    const job = openJob();
+    const job = await openJob();
     const res = await apply(job.slug, formData({ cv: pdfFile(Buffer.from("MZ\x90\x00 not a pdf"), "cv.pdf") }));
 
     expect(res.status).toBe(400);
     const body = await res.json();
     expect(body.fieldErrors.cv).toMatch(/isn't a supported CV/);
-    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(await rowsFor(job.id)).toHaveLength(0);
   });
 
   it("400: rejects an oversized body from its Content-Length before parsing it", async () => {
-    const job = openJob();
+    const job = await openJob();
     const res = await apply(job.slug, formData(), { headers: { "content-length": String(50 * 1024 * 1024) } });
 
     expect(res.status).toBe(400);
@@ -153,15 +153,15 @@ describe("POST /api/apply/[slug]", () => {
   });
 
   it("201: accepts a valid application streamed in chunks with no Content-Length", async () => {
-    const job = openJob();
+    const job = await openJob();
     const { res } = await applyStreamed(job.slug, formData());
 
     expect(res.status).toBe(201);
-    expect(rowsFor(job.id)).toHaveLength(1);
+    expect(await rowsFor(job.id)).toHaveLength(1);
   });
 
   it("400: rejects an over-cap chunked body with no Content-Length, stops reading early and stores nothing", async () => {
-    const job = openJob();
+    const job = await openJob();
     const filesBefore = storedFiles();
     // Otherwise valid: without a streaming cap this would be accepted and the padding buffered in memory.
     const body = formData();
@@ -173,22 +173,22 @@ describe("POST /api/apply/[slug]", () => {
     expect(await res.json()).toEqual({ fieldErrors: { cv: CV_TOO_LARGE } });
     expect(totalBytes).toBeGreaterThan(16 * 1024 * 1024);
     expect(bytesRead).toBeLessThan(MAX_CV_BYTES + 2 * 1024 * 1024);
-    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(await rowsFor(job.id)).toHaveLength(0);
     expect(storedFiles()).toEqual(filesBefore);
     expect(scheduleSpy).not.toHaveBeenCalled();
   });
 
-  it("400: a CV over 5 MB that fits inside the body headroom is still rejected, with the same message", async () => {
-    const job = openJob();
+  it("400: a CV over 4 MB that fits inside the body headroom is still rejected, with the same message", async () => {
+    const job = await openJob();
     const filesBefore = storedFiles();
-    const bigPdf = new Uint8Array(MAX_CV_BYTES + 512 * 1024);
+    const bigPdf = new Uint8Array(MAX_CV_BYTES + 128 * 1024);
     bigPdf.set(pdfBytes);
 
     const res = await apply(job.slug, formData({ cv: pdfFile(bigPdf) }));
 
     expect(res.status).toBe(400);
     expect(await res.json()).toEqual({ fieldErrors: { cv: CV_TOO_LARGE } });
-    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(await rowsFor(job.id)).toHaveLength(0);
     expect(storedFiles()).toEqual(filesBefore);
   });
 
@@ -199,28 +199,28 @@ describe("POST /api/apply/[slug]", () => {
   });
 
   it("410: closed job", async () => {
-    const { company } = makeCompany();
-    const job = makeJob(company.id, { status: "closed" });
+    const { company } = await makeCompany();
+    const job = await makeJob(company.id, { status: "closed" });
     const res = await apply(job.slug, formData());
 
     expect(res.status).toBe(410);
     expect(await res.json()).toEqual({ error: "This role is no longer accepting applications." });
-    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(await rowsFor(job.id)).toHaveLength(0);
   });
 
   it("409: a second application with the same email (any case) is rejected", async () => {
-    const job = openJob();
+    const job = await openJob();
     expect((await apply(job.slug, formData())).status).toBe(201);
 
     const res = await apply(job.slug, formData({ email: "JANE.DOE@example.com" }));
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ error: "You've already applied for this role with this email address." });
-    expect(rowsFor(job.id)).toHaveLength(1);
+    expect(await rowsFor(job.id)).toHaveLength(1);
     expect(scheduleSpy).toHaveBeenCalledTimes(1);
   });
 
   it("429: the 6th submission from one IP within 10 minutes is rejected with Retry-After", async () => {
-    const job = openJob();
+    const job = await openJob();
     for (let i = 0; i < 5; i++) {
       const res = await apply(job.slug, formData({ email: `applicant${i}@example.com` }), { ip: "203.0.113.7" });
       expect(res.status).toBe(201);
@@ -230,14 +230,14 @@ describe("POST /api/apply/[slug]", () => {
     expect(res.status).toBe(429);
     expect(await res.json()).toEqual({ error: "Too many submissions. Please try again in a few minutes." });
     expect(Number(res.headers.get("Retry-After"))).toBeGreaterThan(0);
-    expect(rowsFor(job.id)).toHaveLength(5);
+    expect(await rowsFor(job.id)).toHaveLength(5);
 
     const otherIp = await apply(job.slug, formData({ email: "someone@example.com" }), { ip: "203.0.113.8" });
     expect(otherIp.status).toBe(201);
   });
 
   it("429: caps valid submissions per job at 300 an hour, across IPs", async () => {
-    const job = openJob();
+    const job = await openJob();
     for (let i = 0; i < 300; i++) {
       const res = await apply(job.slug, formData({ email: `a${i}@example.com` }), { ip: `10.${Math.floor(i / 250)}.0.${i % 250}` });
       expect(res.status).toBe(201);
@@ -246,29 +246,30 @@ describe("POST /api/apply/[slug]", () => {
     const res = await apply(job.slug, formData({ email: "late@example.com" }), { ip: "192.0.2.200" });
     expect(res.status).toBe(429);
     expect(res.headers.get("Retry-After")).toBeTruthy();
-    expect(rowsFor(job.id)).toHaveLength(300);
-  });
+    expect(await rowsFor(job.id)).toHaveLength(300);
+    // Intentional: 30 s, not the 5 s default — 300 full submissions, each several Postgres round trips.
+  }, 30_000);
 
   it("honeypot: responds 201 but stores nothing and schedules nothing", async () => {
-    const job = openJob();
+    const job = await openJob();
     const res = await apply(job.slug, formData({ hp_x7q: "https://spam.example" }));
 
     expect(res.status).toBe(201);
     expect(await res.json()).toEqual({ ok: true });
-    expect(rowsFor(job.id)).toHaveLength(0);
+    expect(await rowsFor(job.id)).toHaveLength(0);
     expect(scheduleSpy).not.toHaveBeenCalled();
   });
 
   it("still returns 201 if scheduling throws, since the application is stored", async () => {
-    const job = openJob();
-    scheduleSpy.mockImplementationOnce(() => {
+    const job = await openJob();
+    scheduleSpy.mockImplementationOnce(async () => {
       throw new Error("queue down");
     });
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
 
     const res = await apply(job.slug, formData());
     expect(res.status).toBe(201);
-    expect(rowsFor(job.id)).toHaveLength(1);
+    expect(await rowsFor(job.id)).toHaveLength(1);
     errorLog.mockRestore();
   });
 });

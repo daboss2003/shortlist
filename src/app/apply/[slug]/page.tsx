@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import { connection } from "next/server";
 import { Suspense, cache, type ReactNode } from "react";
 import { Award, Briefcase, Building2, Calendar, ExternalLink, MapPin, type LucideIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -15,11 +16,16 @@ import { PoweredByFooter } from "./_components/powered-by-footer";
 const container = "mx-auto w-full max-w-5xl px-4 sm:px-6 lg:px-8";
 
 // generateMetadata and the page both read the job in the same request.
-const getJob = cache(getPublicJobBySlug);
+const getJob = cache(async (slug: string) => {
+  // Intentional: connection() first — with only `params` awaited, Next may run this read in a runtime prefetch, where
+  // the database driver's use of the clock (Date.now) is rejected. The apply page must render per request anyway.
+  await connection();
+  return getPublicJobBySlug(slug);
+});
 
 export async function generateMetadata(props: PageProps<"/apply/[slug]">): Promise<Metadata> {
   const { slug } = await props.params;
-  const job = getJob(slug);
+  const job = await getJob(slug);
   // Intentional: job links are unlisted (shared by the employer), so search engines must not index them.
   const robots = { index: false, follow: false };
   if (!job) return { title: { absolute: "Job not found" }, robots };
@@ -42,7 +48,7 @@ export default function Page(props: PageProps<"/apply/[slug]">) {
 
 async function ApplyContent({ params }: Pick<PageProps<"/apply/[slug]">, "params">) {
   const { slug } = await params;
-  const job = getJob(slug);
+  const job = await getJob(slug);
   if (!job) notFound();
 
   const isOpen = job.status === "open";

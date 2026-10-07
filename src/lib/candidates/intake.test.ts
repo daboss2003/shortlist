@@ -1,8 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
+import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { db } from "@/db";
 import { candidates } from "@/db/schema";
+import { MAX_CV_BYTES } from "@/lib/cv/file-type";
 import { makeCompany, makeJob } from "../../../test/factories";
 import {
   CvValidationError,
@@ -38,8 +40,11 @@ describe("validateCvUpload", () => {
 
   it("rejects empty and oversized files", async () => {
     await expect(validateCvUpload(pdfFile("empty.pdf", Buffer.alloc(0)))).rejects.toThrow(/empty/);
-    const big = Buffer.concat([pdfBytes, Buffer.alloc(5 * 1024 * 1024)]);
-    await expect(validateCvUpload(pdfFile("big.pdf", big))).rejects.toThrow(/larger than 5 MB/);
+    const big = Buffer.concat([pdfBytes, Buffer.alloc(MAX_CV_BYTES)]);
+    await expect(validateCvUpload(pdfFile("big.pdf", big))).rejects.toThrow("big.pdf is larger than 4 MB.");
+    // Exactly at the cap is fine.
+    const atCap = Buffer.concat([pdfBytes, Buffer.alloc(MAX_CV_BYTES - pdfBytes.length)]);
+    await expect(validateCvUpload(pdfFile("at-cap.pdf", atCap))).resolves.toMatchObject({ size: MAX_CV_BYTES });
   });
 
   it("strips path segments from the display name", async () => {
@@ -50,8 +55,8 @@ describe("validateCvUpload", () => {
 
 describe("createCandidateFromCv", () => {
   it("stores the file under a server-generated key and inserts a pending candidate", async () => {
-    const { company } = makeCompany();
-    const job = makeJob(company.id);
+    const { company } = await makeCompany();
+    const job = await makeJob(company.id);
     const cv = await validateCvUpload(pdfFile());
     const c = await createCandidateFromCv({
       job,
@@ -65,8 +70,8 @@ describe("createCandidateFromCv", () => {
   });
 
   it("rejects a second public application with the same email (case-insensitive) and cleans up the file", async () => {
-    const { company } = makeCompany();
-    const job = makeJob(company.id);
+    const { company } = await makeCompany();
+    const job = await makeJob(company.id);
     const cv = await validateCvUpload(pdfFile());
     const applicant = { name: "Jane", email: "jane@example.com", phone: null };
     await createCandidateFromCv({ job, source: "public", cv, applicant });
@@ -79,17 +84,17 @@ describe("createCandidateFromCv", () => {
   });
 
   it("allows employer uploads without applicant details, skipping only byte-identical files", async () => {
-    const { company } = makeCompany();
-    const job = makeJob(company.id);
+    const { company } = await makeCompany();
+    const job = await makeJob(company.id);
     const cv = await validateCvUpload(pdfFile());
     await createCandidateFromCv({ job, source: "upload", cv });
     await expect(createCandidateFromCv({ job, source: "upload", cv })).rejects.toBeInstanceOf(DuplicateCvError);
 
     const other = await validateCvUpload(pdfFile("Other.pdf", Buffer.from("%PDF-1.4\n% a different CV\n")));
     await createCandidateFromCv({ job, source: "upload", cv: other });
-    expect(db.select().from(candidates).all().filter((c) => c.jobId === job.id)).toHaveLength(2);
+    expect(await db.select().from(candidates).where(eq(candidates.jobId, job.id))).toHaveLength(2);
 
     // The same file in a different job is fine.
-    await createCandidateFromCv({ job: makeJob(company.id), source: "upload", cv });
+    await createCandidateFromCv({ job: await makeJob(company.id), source: "upload", cv });
   });
 });

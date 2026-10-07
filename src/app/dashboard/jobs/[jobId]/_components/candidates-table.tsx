@@ -15,8 +15,9 @@ import { cn } from "@/lib/cn";
 import { CANDIDATE_STAGE_LABELS, CANDIDATE_STATUS_LABELS } from "@/lib/format";
 import { deleteCandidatesAction, rescoreAction, updateStageAction, type ReviewActionResult } from "../actions";
 import { useAnnounce } from "./announcer";
-import { downloadFile } from "./download";
+import { downloadFile, saveBlob } from "./download";
 import { useRestoreFocus } from "./use-restore-focus";
+import { prepareCvZip, type ExportRequest } from "./zip-export";
 
 /** Slim, serializable row — the page never ships cvText or full profiles to the client. */
 export type CandidateRow = {
@@ -103,6 +104,10 @@ export function CandidatesTable({
   const [notice, setNotice] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<"rescore-all" | "delete" | null>(null);
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
+  // CVs fetched so far while the browser builds a ZIP; null until the manifest says how many there are.
+  const [zipProgress, setZipProgress] = useState<{ done: number; total: number } | null>(null);
+  // A finished export that left something out (CVs missing from a ZIP).
+  const [exportWarning, setExportWarning] = useState<string | null>(null);
   const restoreFocus = useRestoreFocus();
   const ids = {
     selectAll: useId(),
@@ -138,6 +143,7 @@ export function CandidatesTable({
 
   function run(action: BulkAction, call: () => Promise<ReviewActionResult>) {
     setError(null);
+    setExportWarning(null);
     setNotice(null);
     setBusy(action);
     startTransition(async () => {
@@ -176,23 +182,59 @@ export function CandidatesTable({
   // Exporting every visible row is the same as exporting the view, and needs no id list.
   const exportSelection = selectedIds.length > 0 && !allSelected;
 
-  async function exportAs(format: ExportFormat, done: string) {
-    setError(null);
-    setExporting(format);
-    const fallbackName = `candidates.${format}`;
+  // The selection as it is now: a ZIP keeps fetching after the click, while the user may change the selection.
+  const exportRequest: ExportRequest = (format) => {
     // The stage goes along with a selection too, so exported ranks match the ones on screen.
     const fields: Record<string, string> = stage ? { format, stage } : { format };
-    const outcome = exportSelection
+    return exportSelection
       ? // Intentional: POST for selections — hundreds of ids overflow URL length limits.
-        await downloadFile(
-          `/api/jobs/${jobId}/export`,
-          { method: "POST", body: new URLSearchParams({ ...fields, ids: selectedIds.join(",") }) },
-          fallbackName,
-        )
-      : await downloadFile(`/api/jobs/${jobId}/export?${new URLSearchParams(fields)}`, undefined, fallbackName);
+        [`/api/jobs/${jobId}/export`, { method: "POST", body: new URLSearchParams({ ...fields, ids: selectedIds.join(",") }) }]
+      : [`/api/jobs/${jobId}/export?${new URLSearchParams(fields)}`];
+  };
+
+  async function exportAs(format: ExportFormat, done: string) {
+    setError(null);
+    setExportWarning(null);
+    setExporting(format);
+    if (format === "zip") {
+      await exportZip(done);
+      return;
+    }
+    const outcome = await downloadFile(...exportRequest(format), `candidates.${format}`);
     setExporting(null);
     if (outcome.ok) announce(done);
     else setError(outcome.sessionExpired ? outcome.error : `Couldn't export — ${outcome.error}`);
+  }
+
+  async function exportZip(done: string) {
+    let announced = false;
+    try {
+      const result = await prepareCvZip(exportRequest, (fetched, total) => {
+        setZipProgress({ done: fetched, total });
+        if (!announced) {
+          announced = true;
+          announce(`Preparing a ZIP of ${plural(total, "CV")}…`);
+        }
+      });
+      if (!result.ok) {
+        setError(result.sessionExpired ? result.error : `Couldn't export — ${result.error}`);
+        return;
+      }
+      saveBlob(result.blob, result.fileName);
+      if (result.missing > 0) {
+        const warning = `ZIP downloaded, but ${plural(result.missing, "CV")} of ${result.total} couldn't be included. They're listed in missing-files.txt inside the ZIP.`;
+        setExportWarning(warning);
+        announce(warning);
+      } else {
+        announce(done);
+      }
+    } catch {
+      // JSZip failed to load (e.g. a deploy replaced the chunk) or ran out of memory building the archive.
+      setError("Couldn't export — the ZIP couldn't be built. Try again, or export a stage or a selection.");
+    } finally {
+      setExporting(null);
+      setZipProgress(null);
+    }
   }
 
   const actionIcon = (action: BulkAction, Icon: typeof Check) =>
@@ -308,15 +350,22 @@ export function CandidatesTable({
               disabled={exporting !== null}
             >
               {exporting === format ? <Loader2 className="animate-spin" aria-hidden /> : <Download aria-hidden />}
-              {label}
+              {format === "zip" && exporting === "zip" ? (
+                <span className="tabular-nums">
+                  Preparing ZIP…{zipProgress && ` ${zipProgress.done} of ${zipProgress.total}`}
+                </span>
+              ) : (
+                label
+              )}
             </Button>
           ))}
         </div>
       </div>
 
-      {error && (
-        <div className="border-b border-line px-4 py-3">
-          <Alert tone="danger">{error}</Alert>
+      {(error || exportWarning) && (
+        <div className="space-y-3 border-b border-line px-4 py-3">
+          {error && <Alert tone="danger">{error}</Alert>}
+          {exportWarning && <Alert tone="warning">{exportWarning}</Alert>}
         </div>
       )}
 

@@ -9,7 +9,7 @@ export async function GET(_request: Request, ctx: RouteContext<"/api/candidates/
   if (!employer) return jsonError(401, "Your session has expired. Sign in again.");
 
   const { candidateId } = await ctx.params;
-  const candidate = getCandidateForCompany(employer.companyId, candidateId);
+  const candidate = await getCandidateForCompany(employer.companyId, candidateId);
   if (!candidate) return jsonError(404, "CV not found.");
 
   let bytes: Buffer;

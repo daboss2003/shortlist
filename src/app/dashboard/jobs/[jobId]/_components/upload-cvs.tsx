@@ -15,10 +15,9 @@ import { UPLOAD_DROPZONE_ID, UPLOAD_MORE_ID, UPLOAD_SECTION_ID } from "./job-hea
 import { useRestoreFocus } from "./use-restore-focus";
 
 const MAX_BATCH_FILES = 50;
-// Intentional: a batch is sent as several small requests. A proxy buffers request bodies only up to
-// 10 MB (proxyClientMaxBodySize) and silently truncates the rest; small requests also give progress.
-const MAX_REQUEST_FILES = 10;
-const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+// Intentional: one CV per request, two requests at a time. Netlify Functions accept ~4.5 MB of binary per
+// request, so the server takes exactly one file; two in parallel keep a batch moving without hogging the uplink.
+const UPLOAD_CONCURRENCY = 2;
 const MAX_MB = MAX_CV_BYTES / (1024 * 1024);
 const RETRY_ID = "upload-cvs-retry";
 const CLOSED_MESSAGE = "This job is closed. Reopen it to add CVs.";
@@ -39,8 +38,10 @@ type Fatal = { message: string; retryable: boolean; jobClosed?: boolean };
 type UploadResult = UploadResponse["results"][number];
 
 type SendOutcome =
-  | { type: "results"; results: UploadResult[] }
-  | { type: "batch-error"; error: string }
+  | { type: "result"; result: UploadResult }
+  /** This file was refused (e.g. too large for the server); the rest of the batch carries on. */
+  | { type: "file-error"; error: string }
+  /** Nothing more can be sent until the user acts (signed out, job closed or gone, server down). */
   | { type: "fatal"; fatal: Fatal };
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -55,31 +56,14 @@ function clientError(file: File): string | null {
   return null;
 }
 
-function toRequests(queue: Item[]): Item[][] {
-  const groups: Item[][] = [];
-  let group: Item[] = [];
-  let bytes = 0;
-  for (const item of queue) {
-    if (group.length > 0 && (group.length >= MAX_REQUEST_FILES || bytes + item.file.size > MAX_REQUEST_BYTES)) {
-      groups.push(group);
-      group = [];
-      bytes = 0;
-    }
-    group.push(item);
-    bytes += item.file.size;
-  }
-  if (group.length > 0) groups.push(group);
-  return groups;
-}
-
 async function errorMessage(res: Response): Promise<string | undefined> {
   const error = ((await res.json().catch(() => null)) as { error?: unknown } | null)?.error;
   return typeof error === "string" && error ? error : undefined;
 }
 
-async function send(jobId: string, group: Item[]): Promise<SendOutcome> {
+async function send(jobId: string, file: File): Promise<SendOutcome> {
   const body = new FormData();
-  for (const item of group) body.append("files", item.file, item.file.name);
+  body.append("files", file, file.name);
 
   let res: Response;
   try {
@@ -90,8 +74,8 @@ async function send(jobId: string, group: Item[]): Promise<SendOutcome> {
 
   if (res.ok) {
     const data = (await res.json().catch(() => null)) as UploadResponse | null;
-    if (data && Array.isArray(data.results) && data.results.length === group.length) {
-      return { type: "results", results: data.results };
+    if (data && Array.isArray(data.results) && data.results.length === 1) {
+      return { type: "result", result: data.results[0] };
     }
     return { type: "fatal", fatal: { message: "The server sent an unexpected response. Try again.", retryable: true } };
   }
@@ -108,7 +92,8 @@ async function send(jobId: string, group: Item[]): Promise<SendOutcome> {
   if (res.status >= 500) {
     return { type: "fatal", fatal: { message: "Something went wrong on our side. The remaining CVs weren't uploaded.", retryable: true } };
   }
-  return { type: "batch-error", error: (await errorMessage(res)) ?? "This file couldn't be uploaded." };
+  if (res.status === 413) return { type: "file-error", error: (await errorMessage(res)) ?? `Larger than ${MAX_MB} MB.` };
+  return { type: "file-error", error: (await errorMessage(res)) ?? "This file couldn't be uploaded." };
 }
 
 function summarize(added: number, duplicates: number, failed: number) {
@@ -215,11 +200,8 @@ export function UploadCvsCard({ jobId, closed }: { jobId: string; closed: boolea
     restoreFocus(UPLOAD_DROPZONE_ID, UPLOAD_SECTION_ID);
   }
 
-  function setStatus(keys: Set<string>, status: (item: Item, index: number) => ItemStatus) {
-    setItems((prev) => {
-      let index = -1;
-      return prev.map((item) => (keys.has(item.key) ? { ...item, status: status(item, ++index) } : item));
-    });
+  function setStatus(key: string, status: ItemStatus) {
+    setItems((prev) => prev.map((item) => (item.key === key ? { ...item, status } : item)));
   }
 
   async function upload() {
@@ -233,51 +215,56 @@ export function UploadCvsCard({ jobId, closed }: { jobId: string; closed: boolea
 
     // Earlier runs of this batch (before a "Try again") count towards the final summary too.
     const count = (kind: ItemStatus["kind"]) => items.filter((i) => i.status.kind === kind).length;
-    let created = 0;
-    let skipped = 0;
-    let failed = count("failed") + count("invalid");
-    let sent = 0;
-    let stopped = false;
-    try {
-      for (const group of toRequests(queue)) {
-        const keys = new Set(group.map((i) => i.key));
-        setStatus(keys, () => ({ kind: "sending" }));
-        const outcome = await send(jobId, group);
+    // An object, not `let`s: the workers below update it across awaits, which TypeScript's narrowing ignores.
+    const run = { next: 0, sent: 0, created: 0, skipped: 0, failed: count("failed") + count("invalid"), stopped: false };
+
+    // Each worker takes the next queued file until the queue is empty or the batch is stopped. Requests already in
+    // flight when another one stops the batch still finish and report their own result.
+    async function worker() {
+      while (!run.stopped && run.next < queue.length) {
+        const item = queue[run.next++];
+        setStatus(item.key, { kind: "sending" });
+        const outcome = await send(jobId, item.file);
 
         if (outcome.type === "fatal") {
-          setStatus(keys, () => ({ kind: "queued" }));
-          setFatal(outcome.fatal);
-          stopped = true;
-          if (outcome.fatal.jobClosed) router.refresh();
-          break;
+          setStatus(item.key, { kind: "queued" });
+          if (!run.stopped) {
+            run.stopped = true;
+            setFatal(outcome.fatal);
+            if (outcome.fatal.jobClosed) router.refresh();
+          }
+          return;
         }
-        if (outcome.type === "batch-error") {
-          setStatus(keys, () => ({ kind: "failed", error: outcome.error }));
-          failed += group.length;
+        if (outcome.type === "file-error") {
+          setStatus(item.key, { kind: "failed", error: outcome.error });
+          run.failed++;
+        } else if (outcome.result.ok) {
+          setStatus(item.key, { kind: "added" });
+          run.created++;
+        } else if (isDuplicate(outcome.result)) {
+          setStatus(item.key, { kind: "duplicate" });
+          run.skipped++;
         } else {
-          // Results come back in the order the files were sent; `group` preserves list order.
-          setStatus(keys, (_item, i) => {
-            const result = outcome.results[i];
-            if (result.ok) return { kind: "added" };
-            return isDuplicate(result) ? { kind: "duplicate" } : { kind: "failed", error: result.error };
-          });
-          created += outcome.results.filter((r) => r.ok).length;
-          skipped += outcome.results.filter(isDuplicate).length;
-          failed += outcome.results.filter((r) => !r.ok && !isDuplicate(r)).length;
+          setStatus(item.key, { kind: "failed", error: outcome.result.error });
+          run.failed++;
         }
-        sent += group.length;
-        setProgress({ done: sent, total: queue.length });
-        if (sent < queue.length) announce(`Uploaded ${sent} of ${queue.length}`);
+        run.sent++;
+        setProgress({ done: run.sent, total: queue.length });
+        if (run.sent < queue.length) announce(`Uploaded ${run.sent} of ${queue.length}`);
       }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, worker));
     } finally {
       setUploading(false);
       restoreFocus(UPLOAD_MORE_ID, RETRY_ID, UPLOAD_SECTION_ID);
-      if (created > 0) router.refresh();
+      if (run.created > 0) router.refresh();
     }
 
     // A stopped upload is reported by its alert (role="alert"); otherwise read out the same summary that's shown.
-    if (!stopped) {
-      const summary = summarize(count("added") + created, count("duplicate") + skipped, failed);
+    if (!run.stopped) {
+      const summary = summarize(count("added") + run.created, count("duplicate") + run.skipped, run.failed);
       announce(`${summary.title}. ${summary.body}`);
     }
   }
@@ -347,7 +334,7 @@ export function UploadCvsCard({ jobId, closed }: { jobId: string; closed: boolea
                   )}
                 </span>
                 <span className="text-xs text-ink-muted">
-                  PDF, Word (.doc, .docx) or plain text · up to {MAX_MB} MB each · {MAX_BATCH_FILES} files per batch
+                  PDF, Word (.doc, .docx) or plain text · up to {MAX_MB} MB each
                 </span>
               </button>
               <input

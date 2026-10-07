@@ -30,7 +30,7 @@ export async function updateStageAction(
   const input = stageInput.safeParse({ jobId, ids, stage });
   if (!input.success) return INVALID;
 
-  const count = setCandidatesStage(employer.companyId, input.data.jobId, input.data.ids, input.data.stage);
+  const count = await setCandidatesStage(employer.companyId, input.data.jobId, input.data.ids, input.data.stage);
   refresh();
   return { ok: true, count };
 }
@@ -40,8 +40,8 @@ export async function rescoreAction(jobId: string, ids: string[] | "all"): Promi
   const input = rescoreInput.safeParse({ jobId, ids });
   if (!input.success) return INVALID;
 
-  const queued = markForRescore(employer.companyId, input.data.jobId, input.data.ids);
-  if (queued.length > 0) scheduleCandidateProcessing(queued);
+  const queued = await markForRescore(employer.companyId, input.data.jobId, input.data.ids);
+  if (queued.length > 0) await scheduleCandidateProcessing(queued);
   refresh();
   return { ok: true, count: queued.length };
 }

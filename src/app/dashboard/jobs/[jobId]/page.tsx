@@ -26,7 +26,7 @@ import { UploadCvsCard } from "./_components/upload-cvs";
 
 export async function generateMetadata(props: PageProps<"/dashboard/jobs/[jobId]">): Promise<Metadata> {
   const [{ jobId }, employer] = await Promise.all([props.params, getCurrentEmployer()]);
-  const job = employer ? getJobForCompany(employer.companyId, jobId) : null;
+  const job = employer ? await getJobForCompany(employer.companyId, jobId) : null;
   return { title: job?.title ?? "Job" };
 }
 
@@ -47,17 +47,20 @@ const EMPTY_STAGE_COPY: Record<CandidateStage, string> = {
 async function JobDetail({ params, searchParams }: PageProps<"/dashboard/jobs/[jobId]">) {
   const employer = await requireEmployer();
   const [{ jobId }, query] = await Promise.all([params, searchParams]);
-  const job = getJobForCompany(employer.companyId, jobId);
+  const job = await getJobForCompany(employer.companyId, jobId);
   if (!job) notFound();
 
   const stage = parseStage(query.stage);
-  const candidates = listCandidatesForJob(employer.companyId, job.id);
-  // Ranks restart within a stage — the same numbering an export of that stage uses.
-  const visible = stage ? listCandidatesForJob(employer.companyId, job.id, { stage }) : candidates;
+  const [candidates, stageCandidates, quota, retentionDays] = await Promise.all([
+    listCandidatesForJob(employer.companyId, job.id),
+    // Ranks restart within a stage — the same numbering an export of that stage uses.
+    stage ? listCandidatesForJob(employer.companyId, job.id, { stage }) : null,
+    getAiQuota(employer.companyId),
+    getCompanyRetentionDays(employer.companyId),
+  ]);
+  const visible = stageCandidates ?? candidates;
   const analyzing = candidates.some((c) => c.status === "pending" || c.status === "processing");
   const ai = getAiStatus();
-  const quota = getAiQuota(employer.companyId);
-  const retentionDays = getCompanyRetentionDays(employer.companyId);
   const deletionDate = candidateDataDeletionDate(job, retentionDays);
   const closed = job.status === "closed";
 

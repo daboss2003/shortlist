@@ -5,9 +5,9 @@ import { BodyTooLargeError, readFormDataWithLimit } from "@/lib/body-limit";
 import { listCandidatesForJob } from "@/lib/data/candidates";
 import { getJobForCompany } from "@/lib/data/jobs";
 import { toCsv } from "@/lib/export/csv";
+import { safeFileStem } from "@/lib/export/file-name";
 import { EXPORT_COLUMNS, toExportRows } from "@/lib/export/rows";
 import { toXlsx } from "@/lib/export/xlsx";
-import { ZipTooLargeError, buildCandidatesZip, safeFileStem } from "@/lib/export/zip";
 import { isSameOrigin, jsonError } from "@/lib/http";
 
 // A GET selection travels in the URL, so it's kept short; larger selections are POSTed.
@@ -18,8 +18,26 @@ const MAX_POST_BODY_BYTES = 64 * 1024;
 const CONTENT_TYPES = {
   csv: "text/csv; charset=utf-8",
   xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  zip: "application/zip",
 } as const;
+
+/** One CV for the browser-built ZIP, in ranked order. */
+export type ZipManifestEntry = {
+  id: string;
+  /** The same rank the CSV/XLSX rows carry; null while unscored. */
+  rank: number | null;
+  /** The export's Name column. */
+  name: string;
+  cvFileName: string;
+  /** Stored file type (pdf, docx, doc or txt), from the server-generated storage key. */
+  cvExt: string;
+  cvSize: number;
+};
+
+/**
+ * `format=manifest`: what a ZIP of this selection contains. The CSV, XLSX and every CV are then fetched and
+ * zipped in the browser, because a server-built ZIP of many CVs can exceed Netlify's 20 MB response and 60 s caps.
+ */
+export type ZipManifest = { baseName: string; candidates: ZipManifestEntry[] };
 
 const idsSchema = (max: number) =>
   z
@@ -28,7 +46,9 @@ const idsSchema = (max: number) =>
     .max(max, { error: `You can export at most ${max} selected candidates.` });
 
 const exportFields = {
-  format: z.enum(["csv", "xlsx", "zip"], { error: "Invalid export format." }),
+  // Intentional: "zip" is accepted only to answer it with a clear 400 — the ZIP is now built in the browser, and a
+  // tab loaded before that change still asks the server for it.
+  format: z.enum(["csv", "xlsx", "manifest", "zip"], { error: "Invalid export format." }),
   stage: z.enum(CANDIDATE_STAGES, { error: "Invalid stage." }).optional(),
 };
 const getSchema = z.object({ ...exportFields, ids: idsSchema(MAX_GET_IDS).optional() });
@@ -54,23 +74,33 @@ const optionalField = (value: FormDataEntryValue | null) => (value === null || v
 const fileSlug = (title: string) => safeFileStem(title, "job").toLowerCase().slice(0, 50).replace(/-+$/, "") || "job";
 
 async function exportCandidates(companyId: string, job: Job, { format, stage, ids }: ExportQuery): Promise<Response> {
-  const candidates = listCandidatesForJob(companyId, job.id, { ids, stage });
+  if (format === "zip") return jsonError(400, "ZIP exports are built in the browser.");
+
+  const candidates = await listCandidatesForJob(companyId, job.id, { ids, stage });
   if (candidates.length === 0) return jsonError(400, "No candidates to export.");
 
   const rows = toExportRows(candidates);
   const baseName = `${fileSlug(job.title)}-candidates-${new Date().toISOString().slice(0, 10)}`;
 
-  let body: string | Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>;
-  if (format === "csv") body = toCsv(EXPORT_COLUMNS, rows);
-  else if (format === "xlsx") body = new Uint8Array(await toXlsx(EXPORT_COLUMNS, rows, { sheetName: job.title }));
-  else {
-    try {
-      body = await buildCandidatesZip(candidates, rows, { baseName, sheetName: job.title });
-    } catch (err) {
-      if (err instanceof ZipTooLargeError) return jsonError(400, err.message);
-      throw err;
-    }
+  if (format === "manifest") {
+    const manifest: ZipManifest = {
+      baseName,
+      candidates: candidates.map((c, i) => ({
+        id: c.id,
+        rank: c.rank,
+        name: String(rows[i].Name ?? c.cvFileName),
+        cvFileName: c.cvFileName,
+        cvExt: c.cvFileKey.slice(c.cvFileKey.lastIndexOf(".") + 1),
+        cvSize: c.cvSize,
+      })),
+    };
+    return Response.json(manifest, { headers: { "Cache-Control": "private, no-store" } });
   }
+
+  const body =
+    format === "csv"
+      ? toCsv(EXPORT_COLUMNS, rows)
+      : new Uint8Array(await toXlsx(EXPORT_COLUMNS, rows, { sheetName: job.title }));
 
   return new Response(body, {
     headers: {
@@ -88,7 +118,7 @@ export async function GET(request: Request, ctx: RouteContext<"/api/jobs/[jobId]
   if (!employer) return jsonError(401, "Not signed in.");
 
   const { jobId } = await ctx.params;
-  const job = getJobForCompany(employer.companyId, jobId);
+  const job = await getJobForCompany(employer.companyId, jobId);
   if (!job) return jsonError(404, "Job not found.");
 
   const params = new URL(request.url).searchParams;
@@ -109,7 +139,7 @@ export async function POST(request: Request, ctx: RouteContext<"/api/jobs/[jobId
   if (!isSameOrigin(request)) return jsonError(403, "Cross-origin request blocked.");
 
   const { jobId } = await ctx.params;
-  const job = getJobForCompany(employer.companyId, jobId);
+  const job = await getJobForCompany(employer.companyId, jobId);
   if (!job) return jsonError(404, "Job not found.");
 
   let form: FormData;
