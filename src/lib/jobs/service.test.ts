@@ -1,0 +1,230 @@
+import fs from "node:fs";
+import path from "node:path";
+import { describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
+import { db } from "@/db";
+import { candidates, jobs } from "@/db/schema";
+import { createCandidateFromCv, type ValidatedCv } from "@/lib/candidates/intake";
+import { makeCompany } from "../../../test/factories";
+import {
+  countJobCandidates,
+  createJob,
+  deleteJob,
+  parseJobInput,
+  setJobStatus,
+  slugify,
+  updateJob,
+  type JobData,
+} from "./service";
+
+const validForm = (overrides: Record<string, unknown> = {}) => ({
+  title: "Senior Backend Engineer",
+  department: "Engineering",
+  location: "Lagos, Nigeria · Hybrid",
+  employmentType: "full_time",
+  description: "Build and run our payments APIs.",
+  requirements: "5+ years Node.js and PostgreSQL.",
+  skills: "Node.js, TypeScript, PostgreSQL",
+  minExperienceYears: "5",
+  ...overrides,
+});
+
+function parse(overrides: Record<string, unknown> = {}): JobData {
+  const result = parseJobInput(validForm(overrides));
+  if (!result.ok) throw new Error(`expected valid input, got ${JSON.stringify(result.fieldErrors)}`);
+  return result.data;
+}
+
+function errorsFor(overrides: Record<string, unknown>) {
+  const result = parseJobInput(validForm(overrides));
+  if (result.ok) throw new Error("expected validation to fail");
+  return result.fieldErrors;
+}
+
+const pdfCv = (): ValidatedCv => {
+  const bytes = Buffer.from("%PDF-1.4\n% test cv\n");
+  return { bytes, fileName: "cv.pdf", fileType: "pdf", mimeType: "application/pdf", size: bytes.length };
+};
+const cvPath = (key: string) => path.join(process.env.UPLOAD_DIR!, key);
+
+describe("parseJobInput", () => {
+  it("trims text and turns blank optional fields into null", () => {
+    const data = parse({
+      title: "  Product Designer  ",
+      department: "   ",
+      location: "",
+      employmentType: "",
+      requirements: "",
+      skills: "",
+      minExperienceYears: "",
+    });
+    expect(data).toEqual({
+      title: "Product Designer",
+      department: null,
+      location: null,
+      employmentType: null,
+      description: "Build and run our payments APIs.",
+      requirements: "",
+      skills: [],
+      minExperienceYears: null,
+    });
+  });
+
+  it("splits skills on commas and new lines, trims, drops blanks and dedupes case-insensitively", () => {
+    expect(parse({ skills: " React, typescript ,, TypeScript,\nreact ,GraphQL , " }).skills).toEqual([
+      "React",
+      "typescript",
+      "GraphQL",
+    ]);
+    expect(parse({ skills: ["Go", " go ", "Rust"] }).skills).toEqual(["Go", "Rust"]);
+  });
+
+  it("limits skills to 30, each up to 60 characters", () => {
+    const thirty = Array.from({ length: 30 }, (_, i) => `Skill ${i}`).join(",");
+    expect(parse({ skills: thirty }).skills).toHaveLength(30);
+    expect(errorsFor({ skills: `${thirty}, One more` }).skills).toMatch(/30/);
+    expect(errorsFor({ skills: `Go, ${"x".repeat(61)}` }).skills).toMatch(/60/);
+  });
+
+  it("accepts whole years from 0 to 50", () => {
+    expect(parse({ minExperienceYears: "0" }).minExperienceYears).toBe(0);
+    expect(parse({ minExperienceYears: " 12 " }).minExperienceYears).toBe(12);
+    expect(parse({ minExperienceYears: 50 }).minExperienceYears).toBe(50);
+    for (const bad of ["-1", "51", "2.5", "five"]) {
+      expect(errorsFor({ minExperienceYears: bad }).minExperienceYears).toBeTruthy();
+    }
+  });
+
+  it("reports a field error for each invalid field", () => {
+    const errors = errorsFor({
+      title: " ",
+      description: "",
+      employmentType: "freelance",
+      location: "x".repeat(121),
+      requirements: "x".repeat(20_001),
+    });
+    expect(Object.keys(errors).sort()).toEqual(["description", "employmentType", "location", "requirements", "title"]);
+    expect(errorsFor({ title: "x".repeat(121) }).title).toMatch(/120/);
+    expect(errorsFor({ description: "x".repeat(20_001) }).description).toBeTruthy();
+    expect(parse({ title: "x".repeat(120), description: "x".repeat(20_000) }).title).toHaveLength(120);
+  });
+});
+
+describe("slugs", () => {
+  it("slugifies titles to lowercase ASCII words", () => {
+    expect(slugify("Ingénieur Logiciel (Senior) — Paris!")).toBe("ingenieur-logiciel-senior-paris");
+    expect(slugify("  C++ / Go developer  ")).toBe("c-go-developer");
+    expect(slugify("日本語")).toBe("");
+  });
+
+  it("is the slugified title (max 48 chars) plus a 10-char random suffix, unique per job", () => {
+    const { company } = makeCompany();
+    const a = createJob(company.id, parse({ title: "Senior Backend Engineer" }));
+    const b = createJob(company.id, parse({ title: "Senior Backend Engineer" }));
+    expect(a.slug).toMatch(/^senior-backend-engineer-[a-z0-9]{10}$/);
+    expect(b.slug).toMatch(/^senior-backend-engineer-[a-z0-9]{10}$/);
+    expect(a.slug).not.toBe(b.slug);
+
+    const long = createJob(company.id, parse({ title: "Principal Staff Software Engineer, Payments Infrastructure Platform" }));
+    const [prefix] = long.slug.split(/-(?=[a-z0-9]{10}$)/);
+    expect(prefix.length).toBeLessThanOrEqual(48);
+    expect(prefix.endsWith("-")).toBe(false);
+    expect(long.slug).toMatch(/^principal-staff-software-engineer-payments-infra-[a-z0-9]{10}$/);
+
+    expect(createJob(company.id, parse({ title: "日本語" })).slug).toMatch(/^job-[a-z0-9]{10}$/);
+  });
+});
+
+describe("createJob / updateJob", () => {
+  it("creates an open job for the company", () => {
+    const { company } = makeCompany();
+    const job = createJob(company.id, parse());
+    expect(job).toMatchObject({
+      companyId: company.id,
+      status: "open",
+      title: "Senior Backend Engineer",
+      department: "Engineering",
+      location: "Lagos, Nigeria · Hybrid",
+      employmentType: "full_time",
+      skills: ["Node.js", "TypeScript", "PostgreSQL"],
+      minExperienceYears: 5,
+    });
+    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()).toMatchObject({ slug: job.slug });
+  });
+
+  it("updates the fields but never the slug", () => {
+    const { company } = makeCompany();
+    const job = createJob(company.id, parse());
+    const updated = updateJob(company.id, job.id, parse({ title: "Staff Engineer", skills: "Go", minExperienceYears: "" }));
+    expect(updated).toMatchObject({ id: job.id, title: "Staff Engineer", skills: ["Go"], minExperienceYears: null, slug: job.slug });
+  });
+
+  it("returns null for a missing job or another company's job and leaves it untouched", () => {
+    const a = makeCompany();
+    const b = makeCompany();
+    const job = createJob(a.company.id, parse());
+    expect(updateJob(b.company.id, job.id, parse({ title: "Hijacked" }))).toBeNull();
+    expect(updateJob(a.company.id, "missing-id", parse())).toBeNull();
+    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.title).toBe("Senior Backend Engineer");
+  });
+});
+
+describe("setJobStatus", () => {
+  it("closes and reopens the company's own job", () => {
+    const { company } = makeCompany();
+    const job = createJob(company.id, parse());
+    expect(setJobStatus(company.id, job.id, "closed")).toBe(true);
+    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("closed");
+    expect(setJobStatus(company.id, job.id, "open")).toBe(true);
+    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("open");
+  });
+
+  it("cannot change another company's job", () => {
+    const a = makeCompany();
+    const b = makeCompany();
+    const job = createJob(a.company.id, parse());
+    expect(setJobStatus(b.company.id, job.id, "closed")).toBe(false);
+    expect(setJobStatus(a.company.id, "missing-id", "closed")).toBe(false);
+    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()!.status).toBe("open");
+  });
+});
+
+describe("deleteJob", () => {
+  it("deletes the job, its candidates and their CV files", async () => {
+    const { company } = makeCompany();
+    const job = createJob(company.id, parse());
+    const other = createJob(company.id, parse({ title: "Keep me" }));
+    const c1 = await createCandidateFromCv({ job, source: "upload", cv: pdfCv() });
+    const c2 = await createCandidateFromCv({
+      job,
+      source: "public",
+      cv: pdfCv(),
+      applicant: { name: "Ada", email: "ada@example.com", phone: null },
+    });
+    const kept = await createCandidateFromCv({ job: other, source: "upload", cv: pdfCv() });
+    expect(countJobCandidates(company.id, job.id)).toBe(2);
+    expect(fs.existsSync(cvPath(c1.cvFileKey)) && fs.existsSync(cvPath(c2.cvFileKey))).toBe(true);
+
+    expect(await deleteJob(company.id, job.id)).toBe(true);
+
+    expect(db.select().from(jobs).where(eq(jobs.id, job.id)).get()).toBeUndefined();
+    expect(db.select().from(candidates).where(eq(candidates.jobId, job.id)).all()).toEqual([]);
+    expect(fs.existsSync(cvPath(c1.cvFileKey))).toBe(false);
+    expect(fs.existsSync(cvPath(c2.cvFileKey))).toBe(false);
+    expect(fs.existsSync(cvPath(kept.cvFileKey))).toBe(true);
+    expect(countJobCandidates(company.id, other.id)).toBe(1);
+  });
+
+  it("cannot delete another company's job or touch its files", async () => {
+    const a = makeCompany();
+    const b = makeCompany();
+    const job = createJob(a.company.id, parse());
+    const c = await createCandidateFromCv({ job, source: "upload", cv: pdfCv() });
+
+    expect(await deleteJob(b.company.id, job.id)).toBe(false);
+    expect(await deleteJob(a.company.id, "missing-id")).toBe(false);
+    expect(countJobCandidates(b.company.id, job.id)).toBe(0);
+    expect(countJobCandidates(a.company.id, job.id)).toBe(1);
+    expect(fs.existsSync(cvPath(c.cvFileKey))).toBe(true);
+  });
+});

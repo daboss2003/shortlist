@@ -1,0 +1,60 @@
+import type { Metadata } from "next";
+import { Suspense } from "react";
+import { notFound } from "next/navigation";
+import { Alert, LoadingBlock } from "@/components/ui/feedback";
+import { requireEmployer } from "@/lib/auth/dal";
+import { getJobForCompany } from "@/lib/data/jobs";
+import { countJobCandidates } from "@/lib/jobs/service";
+import { DeleteJobCard } from "../../../_components/delete-job-card";
+import { PageHeader } from "../../../_components/page-header";
+import { deleteJobAction, updateJobAction } from "../../actions";
+import { JobForm } from "../../job-form";
+
+export const metadata: Metadata = { title: "Edit job" };
+
+export default function EditJobPage(props: PageProps<"/dashboard/jobs/[jobId]/edit">) {
+  return (
+    <Suspense fallback={<LoadingBlock />}>
+      <EditJob {...props} />
+    </Suspense>
+  );
+}
+
+async function EditJob({ params }: PageProps<"/dashboard/jobs/[jobId]/edit">) {
+  const { companyId } = await requireEmployer();
+  const { jobId } = await params;
+  const job = getJobForCompany(companyId, jobId);
+  if (!job) notFound();
+  const candidateCount = countJobCandidates(companyId, job.id);
+  const jobHref = `/dashboard/jobs/${job.id}`;
+
+  return (
+    <div className="mx-auto max-w-3xl space-y-6">
+      <PageHeader back={{ href: jobHref, label: job.title }} title="Edit job" />
+      {candidateCount > 0 && (
+        <Alert tone="info">Saving doesn&apos;t re-score existing candidates — use Re-score all on the job page.</Alert>
+      )}
+      <JobForm
+        action={updateJobAction.bind(null, job.id)}
+        defaults={{
+          title: job.title,
+          department: job.department ?? "",
+          location: job.location ?? "",
+          employmentType: job.employmentType ?? "",
+          description: job.description,
+          requirements: job.requirements,
+          skills: job.skills.join(", "),
+          minExperienceYears: job.minExperienceYears?.toString() ?? "",
+        }}
+        submitLabel="Save changes"
+        pendingLabel="Saving…"
+        cancelHref={jobHref}
+      />
+      <DeleteJobCard
+        jobTitle={job.title}
+        candidateCount={candidateCount}
+        deleteAction={deleteJobAction.bind(null, job.id)}
+      />
+    </div>
+  );
+}
