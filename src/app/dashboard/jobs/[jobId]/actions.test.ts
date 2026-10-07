@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { eq } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { db } from "@/db";
@@ -26,7 +28,7 @@ vi.mock("@/lib/pipeline", () => ({ scheduleCandidateProcessing: mocks.schedule }
 vi.mock("next/cache", () => ({ refresh: mocks.refresh }));
 vi.mock("next/navigation", () => ({ redirect: mocks.redirect }));
 
-const { deleteCandidateAction, rescoreAction, updateStageAction } = await import("./actions");
+const { deleteCandidateAction, deleteCandidatesAction, rescoreAction, updateStageAction } = await import("./actions");
 
 const employerFor = (companyId: string): Employer => ({
   userId: "u",
@@ -102,6 +104,54 @@ describe("rescoreAction", () => {
     const { foreignJob } = await setup();
     expect(await rescoreAction(foreignJob.id, "all")).toEqual({ ok: true, count: 0 });
     expect(mocks.schedule).not.toHaveBeenCalled();
+  });
+
+  it("counts and schedules a candidate that is mid-analysis", async () => {
+    const { job, mine } = await setup();
+    db.update(candidates).set({ status: "processing" }).where(eq(candidates.id, mine.id)).run();
+
+    expect(await rescoreAction(job.id, "all")).toEqual({ ok: true, count: 1 });
+    expect(row(mine.id)?.status).toBe("pending");
+    expect(mocks.schedule).toHaveBeenCalledWith([mine.id]);
+  });
+});
+
+describe("deleteCandidatesAction", () => {
+  it("requires a signed-in employer", async () => {
+    await expect(deleteCandidatesAction(crypto.randomUUID(), [crypto.randomUUID()])).rejects.toThrow("REDIRECT:/login");
+  });
+
+  it("deletes own candidates and their CVs, ignores foreign ids and refreshes", async () => {
+    const { job, mine, theirs } = await setup();
+    const cv = await validateCvUpload(new File([new Uint8Array(Buffer.from("%PDF-1.4\n% second\n"))], "b.pdf"));
+    const second = await createCandidateFromCv({ job, source: "upload", cv });
+
+    expect(await deleteCandidatesAction(job.id, [mine.id, second.id, theirs.id])).toEqual({ ok: true, count: 2 });
+
+    expect(row(mine.id)).toBeUndefined();
+    expect(row(second.id)).toBeUndefined();
+    expect(fs.existsSync(path.join(process.env.UPLOAD_DIR!, mine.cvFileKey))).toBe(false);
+    expect(row(theirs.id)).toBeDefined();
+    expect(fs.existsSync(path.join(process.env.UPLOAD_DIR!, theirs.cvFileKey))).toBe(true);
+    expect(mocks.refresh).toHaveBeenCalledOnce();
+    expect(mocks.redirect).not.toHaveBeenCalled();
+  });
+
+  it("can't reach another company's job", async () => {
+    const { foreignJob, theirs } = await setup();
+    expect(await deleteCandidatesAction(foreignJob.id, [theirs.id])).toEqual({ ok: true, count: 0 });
+    expect(row(theirs.id)).toBeDefined();
+  });
+
+  it("rejects malformed input without touching the database", async () => {
+    const { job, mine } = await setup();
+    expect(await deleteCandidatesAction(job.id, ["not-a-uuid"])).toMatchObject({ ok: false });
+    expect(await deleteCandidatesAction(job.id, [])).toMatchObject({ ok: false });
+    expect(await deleteCandidatesAction("not-a-uuid", [mine.id])).toMatchObject({ ok: false });
+    const tooMany = [mine.id, ...Array.from({ length: 500 }, () => crypto.randomUUID())];
+    expect(await deleteCandidatesAction(job.id, tooMany)).toMatchObject({ ok: false });
+    expect(row(mine.id)).toBeDefined();
+    expect(mocks.refresh).not.toHaveBeenCalled();
   });
 });
 

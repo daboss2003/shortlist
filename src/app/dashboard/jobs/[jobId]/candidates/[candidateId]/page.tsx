@@ -11,6 +11,7 @@ import { getCurrentEmployer, requireEmployer } from "@/lib/auth/dal";
 import { candidateDisplayName } from "@/lib/candidates/review";
 import { getCandidateForCompany } from "@/lib/data/candidates";
 import { aiProviderLabel, formatBytes, formatDate } from "@/lib/format";
+import { Announcer } from "../../_components/announcer";
 import { AutoRefresh } from "../../_components/auto-refresh";
 import { CandidateActions, RetryAnalysisButton } from "./candidate-actions";
 import { EvaluationCard } from "./evaluation-card";
@@ -47,94 +48,102 @@ async function CandidateDetail({ params }: Props) {
   const links = profileLinks(profile?.links ?? []);
 
   return (
-    <div className="space-y-6">
-      <div className="space-y-3">
-        <Link
-          href={`/dashboard/jobs/${job.id}`}
-          className="inline-flex max-w-full items-center gap-1 rounded-sm text-sm text-ink-muted hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
-        >
-          <ArrowLeft className="size-4 shrink-0" aria-hidden />
-          <span className="truncate">{job.title}</span>
-        </Link>
-        <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="min-w-0 space-y-2">
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
-              <h1 className="text-2xl font-semibold tracking-tight text-ink [overflow-wrap:anywhere]">{name}</h1>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <StageBadge stage={candidate.stage} />
-                <SourceBadge source={candidate.source} />
-                {status !== "ready" && <StatusBadge status={status} error={candidate.error} />}
+    <Announcer>
+      <div className="space-y-6">
+        <div className="space-y-3">
+          <Link
+            href={`/dashboard/jobs/${job.id}`}
+            className="inline-flex max-w-full items-center gap-1 rounded-sm text-sm text-ink-muted hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
+          >
+            <ArrowLeft className="size-4 shrink-0" aria-hidden />
+            <span className="truncate">{job.title}</span>
+          </Link>
+          <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="min-w-0 space-y-2">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                <h1 className="text-2xl font-semibold tracking-tight text-ink [overflow-wrap:anywhere]">{name}</h1>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <StageBadge stage={candidate.stage} />
+                  <SourceBadge source={candidate.source} />
+                  {status !== "ready" && <StatusBadge status={status} error={candidate.error} />}
+                </div>
               </div>
+              {headline && <p className="text-sm text-ink-muted [overflow-wrap:anywhere]">{headline}</p>}
+              <ContactRow email={email} phone={phone} location={profile?.location ?? null} links={links} />
             </div>
-            {headline && <p className="text-sm text-ink-muted [overflow-wrap:anywhere]">{headline}</p>}
-            <ContactRow email={email} phone={phone} location={profile?.location ?? null} links={links} />
-          </div>
-          <CandidateActions jobId={job.id} candidateId={candidate.id} stage={candidate.stage} status={status} />
-        </header>
-      </div>
-
-      {analyzing && (
-        <Alert tone="info" title="Analyzing this CV — this usually takes under a minute.">
-          {evaluation
-            ? "The results below are from the previous analysis. This page updates on its own."
-            : "This page updates on its own."}
-        </Alert>
-      )}
-      {status === "failed" && (
-        <Alert
-          tone="danger"
-          title="We couldn't analyze this CV"
-          action={<RetryAnalysisButton jobId={job.id} candidateId={candidate.id} />}
-        >
-          {candidate.error ?? "Something went wrong while reading or ranking this CV."}
-        </Alert>
-      )}
-
-      {evaluation || profile ? (
-        <div className="grid items-start gap-6 lg:grid-cols-3">
-          <div className="min-w-0 space-y-6 lg:col-span-2">
-            {evaluation && <EvaluationCard evaluation={evaluation} score={candidate.score} />}
-            {profile && <ProfileCard profile={profile} />}
-          </div>
-          {profile && (
-            <div className="min-w-0">
-              <QualificationsCard profile={profile} />
-            </div>
-          )}
+            <CandidateActions
+              jobId={job.id}
+              candidateId={candidate.id}
+              cvFileName={candidate.cvFileName}
+              stage={candidate.stage}
+              status={status}
+            />
+          </header>
         </div>
-      ) : (
-        <Card>
-          {analyzing ? (
-            <EmptyState
-              icon={<Loader2 className="animate-spin" aria-hidden />}
-              title="Building the candidate profile"
-              description="The match score, strengths and work history appear here once the CV has been analyzed."
-            />
-          ) : (
-            <EmptyState
-              icon={<FileText aria-hidden />}
-              title="No profile yet"
-              description="Download the CV to review it yourself, or try the analysis again."
-            />
-          )}
-        </Card>
-      )}
 
-      <footer className="flex flex-col gap-1 border-t border-line pt-4 text-xs text-ink-faint sm:flex-row sm:flex-wrap sm:justify-between sm:gap-x-6">
-        {candidate.aiProvider && (
-          <p>
-            Ranked by {aiProviderLabel(candidate.aiProvider)}
-            {candidate.aiModel && ` · ${candidate.aiModel}`}
-            {candidate.processedAt && ` · ${formatDate(candidate.processedAt)}`}
-          </p>
+        {analyzing && (
+          <Alert tone="info" title="Analyzing this CV — this usually takes under a minute.">
+            {evaluation
+              ? "The results below are from the previous analysis. This page updates on its own."
+              : "This page updates on its own."}
+          </Alert>
         )}
-        <p className="[overflow-wrap:anywhere]">
-          CV: {candidate.cvFileName} ({formatBytes(candidate.cvSize)}) · Added {formatDate(candidate.createdAt)}
-        </p>
-      </footer>
+        {status === "failed" && (
+          <Alert
+            tone="danger"
+            title="We couldn't analyze this CV"
+            action={<RetryAnalysisButton jobId={job.id} candidateId={candidate.id} />}
+          >
+            {candidate.error ?? "Something went wrong while reading or ranking this CV."}
+          </Alert>
+        )}
 
-      <AutoRefresh active={analyzing} />
-    </div>
+        {evaluation || profile ? (
+          <div className="grid items-start gap-6 lg:grid-cols-3">
+            <div className="min-w-0 space-y-6 lg:col-span-2">
+              {evaluation && <EvaluationCard evaluation={evaluation} score={candidate.score} />}
+              {profile && <ProfileCard profile={profile} />}
+            </div>
+            {profile && (
+              <div className="min-w-0">
+                <QualificationsCard profile={profile} />
+              </div>
+            )}
+          </div>
+        ) : (
+          <Card>
+            {analyzing ? (
+              <EmptyState
+                icon={<Loader2 className="animate-spin" aria-hidden />}
+                title="Building the candidate profile"
+                description="The match score, strengths and work history appear here once the CV has been analyzed."
+              />
+            ) : (
+              <EmptyState
+                icon={<FileText aria-hidden />}
+                title="No profile yet"
+                description="Download the CV to review it yourself, or try the analysis again."
+              />
+            )}
+          </Card>
+        )}
+
+        <footer className="flex flex-col gap-1 border-t border-line pt-4 text-xs text-ink-muted sm:flex-row sm:flex-wrap sm:justify-between sm:gap-x-6">
+          {candidate.aiProvider && (
+            <p>
+              Ranked by {aiProviderLabel(candidate.aiProvider)}
+              {candidate.aiModel && ` · ${candidate.aiModel}`}
+              {candidate.processedAt && ` · ${formatDate(candidate.processedAt)}`}
+            </p>
+          )}
+          <p className="[overflow-wrap:anywhere]">
+            CV: {candidate.cvFileName} ({formatBytes(candidate.cvSize)}) · Added {formatDate(candidate.createdAt)}
+          </p>
+        </footer>
+
+        <AutoRefresh active={analyzing} />
+      </div>
+    </Announcer>
   );
 }
 

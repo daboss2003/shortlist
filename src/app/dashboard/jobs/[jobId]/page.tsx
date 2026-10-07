@@ -2,22 +2,25 @@ import type { Metadata } from "next";
 import { Suspense } from "react";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { ArrowLeft, Inbox, Lock, Pencil, Sparkles, Users } from "lucide-react";
+import { Archive, ArrowLeft, Inbox, Lock, Sparkles, Users } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { ButtonLink } from "@/components/ui/button";
 import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Alert, EmptyState, LoadingBlock } from "@/components/ui/feedback";
-import { CANDIDATE_STAGES, type Candidate, type CandidateStage } from "@/db/schema";
+import { CANDIDATE_STAGES, type CandidateStage } from "@/db/schema";
+import { getAiQuota, type AiQuota } from "@/lib/ai/quota";
 import { getAiStatus, type AiStatus } from "@/lib/ai/status";
 import { getCurrentEmployer, requireEmployer } from "@/lib/auth/dal";
 import { candidateDisplayName } from "@/lib/candidates/review";
 import { cn } from "@/lib/cn";
-import { listCandidatesForJob } from "@/lib/data/candidates";
+import { listCandidatesForJob, type CandidateListItem, type RankedCandidate } from "@/lib/data/candidates";
 import { getJobForCompany } from "@/lib/data/jobs";
 import { CANDIDATE_STAGE_LABELS, EMPLOYMENT_TYPE_LABELS, JOB_STATUS_LABELS, formatDate } from "@/lib/format";
+import { candidateDataDeletionDate, getCompanyRetentionDays } from "@/lib/retention";
+import { LocalTime } from "../../_components/local-time";
+import { Announcer } from "./_components/announcer";
 import { AutoRefresh } from "./_components/auto-refresh";
 import { CandidatesTable, type CandidateRow } from "./_components/candidates-table";
-import { JobStatusToggle, UploadCvsButton } from "./_components/job-header-actions";
+import { JobHeaderActions, UploadCvsButton } from "./_components/job-header-actions";
 import { ShareLink } from "./_components/share-link";
 import { UploadCvsCard } from "./_components/upload-cvs";
 
@@ -49,110 +52,131 @@ async function JobDetail({ params, searchParams }: PageProps<"/dashboard/jobs/[j
 
   const stage = parseStage(query.stage);
   const candidates = listCandidatesForJob(employer.companyId, job.id);
-  const visible = stage ? candidates.filter((c) => c.stage === stage) : candidates;
+  // Ranks restart within a stage — the same numbering an export of that stage uses.
+  const visible = stage ? listCandidatesForJob(employer.companyId, job.id, { stage }) : candidates;
   const analyzing = candidates.some((c) => c.status === "pending" || c.status === "processing");
   const ai = getAiStatus();
+  const quota = getAiQuota(employer.companyId);
+  const retentionDays = getCompanyRetentionDays(employer.companyId);
+  const deletionDate = candidateDataDeletionDate(job, retentionDays);
+  const closed = job.status === "closed";
 
   const meta = [
     job.location,
     job.employmentType && EMPLOYMENT_TYPE_LABELS[job.employmentType],
     job.department,
     `Created ${formatDate(job.createdAt)}`,
+    closed && job.closedAt && `Closed ${formatDate(job.closedAt)}`,
   ].filter(Boolean);
 
+  const aiNotice = aiNoticeKind(ai, quota);
+  const showRetention = closed && deletionDate !== null && retentionDays !== null;
+
   return (
-    <div className="space-y-6">
-      <div className="space-y-3">
-        <Link
-          href="/dashboard"
-          className="inline-flex items-center gap-1 rounded-sm text-sm text-ink-muted hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
-        >
-          <ArrowLeft className="size-4" aria-hidden />
-          Jobs
-        </Link>
-        <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="min-w-0 space-y-1">
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <h1 className="text-2xl font-semibold tracking-tight text-ink [overflow-wrap:anywhere]">{job.title}</h1>
-              <Badge tone={job.status === "open" ? "success" : "neutral"}>{JOB_STATUS_LABELS[job.status]}</Badge>
+    <Announcer>
+      <div className="space-y-6">
+        <div className="space-y-3">
+          <Link
+            href="/dashboard"
+            className="inline-flex items-center gap-1 rounded-sm text-sm text-ink-muted hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
+          >
+            <ArrowLeft className="size-4" aria-hidden />
+            Jobs
+          </Link>
+          <header className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="min-w-0 space-y-1">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <h1 className="text-2xl font-semibold tracking-tight text-ink [overflow-wrap:anywhere]">{job.title}</h1>
+                <Badge tone={job.status === "open" ? "success" : "neutral"}>{JOB_STATUS_LABELS[job.status]}</Badge>
+              </div>
+              <p className="text-sm text-ink-muted">{meta.join(" · ")}</p>
             </div>
-            <p className="text-sm text-ink-muted">{meta.join(" · ")}</p>
-          </div>
-          <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <ButtonLink href={`/dashboard/jobs/${job.id}/edit`} variant="secondary">
-              <Pencil aria-hidden />
-              Edit job
-            </ButtonLink>
-            <JobStatusToggle jobId={job.id} status={job.status} />
-            <UploadCvsButton />
-          </div>
-        </header>
-      </div>
-
-      <AiStatusAlert status={ai} />
-
-      <div className="grid items-start gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader
-            title="Application link"
-            description="Share it anywhere. Applicants upload their CV and are ranked against this job automatically."
-          />
-          <CardBody className="space-y-3">
-            <ShareLink slug={job.slug} />
-            {job.status === "closed" && (
-              <p className="flex items-center gap-2 text-sm text-ink-muted">
-                <Lock className="size-4 shrink-0" aria-hidden />
-                Applications are closed — the link shows a closed notice.
-              </p>
-            )}
-          </CardBody>
-        </Card>
-        <UploadCvsCard jobId={job.id} />
-      </div>
-
-      <section aria-labelledby="candidates-heading" className="space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-          <h2 id="candidates-heading" className="text-base font-semibold text-ink">
-            Candidates <span className="font-normal text-ink-muted tabular-nums">{candidates.length}</span>
-          </h2>
-          <AiRankingLine status={ai} />
+            <JobHeaderActions jobId={job.id} status={job.status} retentionDays={retentionDays} />
+          </header>
         </div>
 
-        {candidates.length === 0 ? (
-          <Card>
-            <EmptyState
-              icon={<Users aria-hidden />}
-              title="No candidates yet"
-              description="Share the application link or upload CVs you already have."
-              action={<UploadCvsButton variant="secondary" />}
-            />
-          </Card>
-        ) : (
-          <>
-            <StageTabs jobId={job.id} active={stage} candidates={candidates} />
-            <Card className="overflow-hidden">
-              {visible.length === 0 && stage ? (
-                <EmptyState
-                  icon={<Inbox aria-hidden />}
-                  title={`No ${CANDIDATE_STAGE_LABELS[stage].toLowerCase()} candidates`}
-                  description={EMPTY_STAGE_COPY[stage]}
-                />
-              ) : (
-                <CandidatesTable
-                  key={stage ?? "all"}
-                  jobId={job.id}
-                  rows={visible.map(toRow)}
-                  stage={stage}
-                  totalInJob={candidates.length}
-                />
-              )}
-            </Card>
-          </>
+        {(aiNotice || showRetention) && (
+          <div className="space-y-3">
+            {aiNotice && <AiNotice kind={aiNotice} quota={quota} />}
+            {showRetention && <RetentionNotice date={deletionDate} days={retentionDays} />}
+          </div>
         )}
-      </section>
 
-      <AutoRefresh active={analyzing} />
-    </div>
+        <div className="grid items-start gap-6 lg:grid-cols-2">
+          <Card>
+            <CardHeader
+              title="Application link"
+              description="Share it anywhere. Applicants upload their CV and are ranked against this job automatically."
+            />
+            <CardBody className="space-y-3">
+              <ShareLink slug={job.slug} />
+              {closed && (
+                <div className="space-y-1.5 text-sm text-ink-muted">
+                  <p className="flex items-center gap-2">
+                    <Lock className="size-4 shrink-0" aria-hidden />
+                    Applications are closed — the link shows a closed notice.
+                  </p>
+                  {deletionDate === null && (
+                    <p className="flex items-center gap-2">
+                      <Archive className="size-4 shrink-0" aria-hidden />
+                      Candidate data is kept until you delete it.
+                    </p>
+                  )}
+                </div>
+              )}
+            </CardBody>
+          </Card>
+          <UploadCvsCard jobId={job.id} closed={closed} />
+        </div>
+
+        <section aria-labelledby="candidates-heading" className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+            <h2 id="candidates-heading" className="text-base font-semibold text-ink">
+              Candidates <span className="font-normal text-ink-muted tabular-nums">{candidates.length}</span>
+            </h2>
+            <AiRankingLine status={ai} />
+          </div>
+
+          {candidates.length === 0 ? (
+            <Card>
+              <EmptyState
+                icon={<Users aria-hidden />}
+                title="No candidates yet"
+                description={
+                  closed
+                    ? "This job is closed. Reopen it to collect applications or upload CVs."
+                    : "Share the application link or upload CVs you already have."
+                }
+                action={closed ? undefined : <UploadCvsButton variant="secondary" />}
+              />
+            </Card>
+          ) : (
+            <>
+              <StageTabs jobId={job.id} active={stage} candidates={candidates} />
+              <Card className="overflow-hidden">
+                {visible.length === 0 && stage ? (
+                  <EmptyState
+                    icon={<Inbox aria-hidden />}
+                    title={`No ${CANDIDATE_STAGE_LABELS[stage].toLowerCase()} candidates`}
+                    description={EMPTY_STAGE_COPY[stage]}
+                  />
+                ) : (
+                  <CandidatesTable
+                    key={stage ?? "all"}
+                    jobId={job.id}
+                    rows={visible.map(toRow)}
+                    stage={stage}
+                    totalInJob={candidates.length}
+                  />
+                )}
+              </Card>
+            </>
+          )}
+        </section>
+
+        <AutoRefresh active={analyzing} />
+      </div>
+    </Announcer>
   );
 }
 
@@ -162,12 +186,11 @@ function parseStage(value: string | string[] | undefined): CandidateStage | null
     : null;
 }
 
-function toRow(c: Candidate, index: number): CandidateRow {
+function toRow(c: RankedCandidate): CandidateRow {
   const years = c.profile?.totalExperienceYears;
   return {
     id: c.id,
-    // listCandidatesForJob ranks scored rows first, so the index is the rank within this filter.
-    rank: c.score === null ? null : index + 1,
+    rank: c.rank,
     name: candidateDisplayName(c),
     subline: c.profile?.headline?.trim() || c.email || null,
     status: c.status,
@@ -182,7 +205,15 @@ function toRow(c: Candidate, index: number): CandidateRow {
   };
 }
 
-function StageTabs({ jobId, active, candidates }: { jobId: string; active: CandidateStage | null; candidates: Candidate[] }) {
+function StageTabs({
+  jobId,
+  active,
+  candidates,
+}: {
+  jobId: string;
+  active: CandidateStage | null;
+  candidates: Array<Pick<CandidateListItem, "stage">>;
+}) {
   const tabs = [
     { stage: null, label: "All", count: candidates.length },
     ...CANDIDATE_STAGES.map((s) => ({
@@ -224,23 +255,44 @@ function StageTabs({ jobId, active, candidates }: { jobId: string; active: Candi
   );
 }
 
-function AiStatusAlert({ status }: { status: AiStatus }) {
-  if (!status.primary) {
+function aiNoticeKind(status: AiStatus, quota: AiQuota): "setup" | "quota" | null {
+  if (!status.primary || status.error) return "setup";
+  return quota.limit !== null && quota.remaining === 0 ? "quota" : null;
+}
+
+/** No env-var names here: whoever reads this may not be the person who deploys the app. */
+function AiNotice({ kind, quota }: { kind: "setup" | "quota"; quota: AiQuota }) {
+  if (kind === "setup") {
     return (
-      <Alert tone="warning" title="No AI provider configured">
-        CVs will wait in the queue. Add GEMINI_API_KEY (or another provider key) and restart.
-        {status.error && <span className="mt-1 block">{status.error}</span>}
+      <Alert tone="warning" title="AI ranking isn't set up yet.">
+        New CVs will wait in the queue and be ranked automatically once it&apos;s ready.
       </Alert>
     );
   }
-  if (status.error) {
-    return (
-      <Alert tone="warning" title="Check the AI configuration">
-        {status.error}
-      </Alert>
-    );
-  }
-  return null;
+  return (
+    <Alert tone="warning" title={`Daily AI limit reached (${quota.limit} CVs today).`}>
+      Remaining CVs will be ranked after <LocalTime iso={quota.resetsAt.toISOString()} />.
+    </Alert>
+  );
+}
+
+const isPast = (date: Date) => date.getTime() <= Date.now();
+
+function RetentionNotice({ date, days }: { date: Date; days: number }) {
+  return (
+    <Alert tone="info">
+      {isPast(date)
+        ? `Candidate data for this job has passed its ${days}-day retention period and is being permanently deleted.`
+        : `Candidate data for this job will be permanently deleted on ${formatDate(date)} (${days} days after closing).`}{" "}
+      <Link
+        href="/dashboard/settings"
+        className="rounded-sm font-medium text-brand-ink underline underline-offset-2 hover:text-ink focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand"
+      >
+        Change this in Settings
+      </Link>
+      .
+    </Alert>
+  );
 }
 
 function AiRankingLine({ status }: { status: AiStatus }) {

@@ -4,6 +4,7 @@ import { useRef, useState, useSyncExternalStore } from "react";
 import { Check, Copy, ExternalLink } from "lucide-react";
 import { Button, buttonClass } from "@/components/ui/button";
 import { Input } from "@/components/ui/field";
+import { useAnnounce } from "./announcer";
 
 const subscribe = () => () => {};
 const getOrigin = () => window.location.origin;
@@ -12,6 +13,7 @@ const getServerOrigin = () => "";
 
 export function ShareLink({ slug }: { slug: string }) {
   const origin = useSyncExternalStore(subscribe, getOrigin, getServerOrigin);
+  const announce = useAnnounce();
   const path = `/apply/${slug}`;
   const url = `${origin}${path}`;
 
@@ -24,11 +26,13 @@ export function ShareLink({ slug }: { slug: string }) {
     try {
       await navigator.clipboard.writeText(`${window.location.origin}${path}`);
       setCopyState("copied");
+      announce("Application link copied");
       timer.current = window.setTimeout(() => setCopyState("idle"), 2000);
     } catch {
       // Clipboard API is unavailable on insecure origins or when permission is denied.
       inputRef.current?.select();
       setCopyState("manual");
+      announce("Couldn't copy automatically. The link is selected — copy it with your keyboard.");
     }
   }
 
@@ -44,10 +48,10 @@ export function ShareLink({ slug }: { slug: string }) {
           readOnly
           value={url}
           onFocus={(e) => e.currentTarget.select()}
-          className="min-w-0 flex-1 font-mono text-xs"
+          className="min-w-0 font-mono text-xs sm:flex-1"
         />
         <div className="flex gap-2">
-          <Button variant="secondary" onClick={copy} className="flex-1 sm:flex-none" aria-live="polite">
+          <Button variant="secondary" onClick={copy} className="flex-1 sm:flex-none">
             {copyState === "copied" ? <Check aria-hidden className="text-success" /> : <Copy aria-hidden />}
             {copyState === "copied" ? "Copied" : "Copy"}
           </Button>

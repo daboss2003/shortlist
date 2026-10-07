@@ -1,4 +1,5 @@
 import "server-only";
+import { createHash } from "node:crypto";
 import { db } from "@/db";
 import { candidates, type Candidate, type CandidateSource } from "@/db/schema";
 import { CV_MIME_TYPES, MAX_CV_BYTES, detectCvFileType, type CvFileType } from "@/lib/cv/file-type";
@@ -13,12 +14,17 @@ export class CvValidationError extends Error {}
 /** A public applicant already applied to this job with this email. */
 export class DuplicateApplicationError extends Error {}
 
+/** The employer already uploaded this exact file (same bytes) to this job. Message is user-safe. */
+export class DuplicateCvError extends Error {}
+
 export type ValidatedCv = {
   bytes: Buffer;
   fileName: string;
   fileType: CvFileType;
   mimeType: string;
   size: number;
+  /** sha256 of the bytes, hex. */
+  sha256: string;
 };
 
 const MAX_MB = MAX_CV_BYTES / (1024 * 1024);
@@ -32,9 +38,10 @@ export async function validateCvUpload(file: File): Promise<ValidatedCv> {
   const bytes = Buffer.from(await file.arrayBuffer());
   const fileType = detectCvFileType(bytes, fileName);
   if (!fileType) {
-    throw new CvValidationError(`${fileName} isn't a supported CV. Upload a PDF, Word (.docx) or plain-text file.`);
+    throw new CvValidationError(`${fileName} isn't a supported CV. Upload a PDF, Word (.doc or .docx) or plain-text file.`);
   }
-  return { bytes, fileName, fileType, mimeType: CV_MIME_TYPES[fileType], size: bytes.length };
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  return { bytes, fileName, fileType, mimeType: CV_MIME_TYPES[fileType], size: bytes.length, sha256 };
 }
 
 export type CreateCandidateInput = {
@@ -45,7 +52,10 @@ export type CreateCandidateInput = {
   applicant?: { name: string; email: string; phone: string | null };
 };
 
-/** Saves the file and inserts a `pending` candidate. Throws DuplicateApplicationError for a repeat public email. */
+/**
+ * Saves the file and inserts a `pending` candidate. Throws DuplicateApplicationError for a repeat public
+ * email, and DuplicateCvError for an identical file the employer already uploaded to this job.
+ */
 export async function createCandidateFromCv(input: CreateCandidateInput): Promise<Candidate> {
   const { job, source, cv, applicant } = input;
   if (source === "public" && !applicant) throw new Error("Public applications require applicant details");
@@ -65,14 +75,19 @@ export async function createCandidateFromCv(input: CreateCandidateInput): Promis
         cvFileName: cv.fileName,
         cvMimeType: cv.mimeType,
         cvSize: cv.size,
+        cvSha256: cv.sha256,
         status: "pending",
       })
       .returning()
       .get();
   } catch (err) {
     await deleteCvFile(key);
-    if (isUniqueViolation(err)) {
+    // Each source has exactly one partial unique index, so the source tells us which rule was hit.
+    if (isUniqueViolation(err) && source === "public") {
       throw new DuplicateApplicationError("You've already applied for this role with this email address.");
+    }
+    if (isUniqueViolation(err) && source === "upload") {
+      throw new DuplicateCvError(`${cv.fileName} is already in this job.`);
     }
     throw err;
   }

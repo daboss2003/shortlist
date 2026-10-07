@@ -1,24 +1,27 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useId, useState, useTransition } from "react";
 import Link from "next/link";
 import { unstable_rethrow } from "next/navigation";
-import { Check, Download, Loader2, RefreshCw, Undo2, X } from "lucide-react";
+import { Check, CheckCircle2, Download, Loader2, RefreshCw, Trash2, Undo2, X } from "lucide-react";
 import { RecommendationBadge, SourceBadge, StageBadge, StatusBadge } from "@/components/candidate/badges";
 import { ScoreBadge } from "@/components/candidate/score-badge";
 import { Badge } from "@/components/ui/badge";
-import { Button, buttonClass } from "@/components/ui/button";
+import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/feedback";
 import type { CandidateSource, CandidateStage, CandidateStatus } from "@/db/schema";
 import type { Recommendation } from "@/lib/ai/schemas";
 import { cn } from "@/lib/cn";
-import { CANDIDATE_STATUS_LABELS } from "@/lib/format";
-import { rescoreAction, updateStageAction, type ReviewActionResult } from "../actions";
+import { CANDIDATE_STAGE_LABELS, CANDIDATE_STATUS_LABELS } from "@/lib/format";
+import { deleteCandidatesAction, rescoreAction, updateStageAction, type ReviewActionResult } from "../actions";
+import { useAnnounce } from "./announcer";
+import { downloadFile } from "./download";
+import { useRestoreFocus } from "./use-restore-focus";
 
 /** Slim, serializable row — the page never ships cvText or full profiles to the client. */
 export type CandidateRow = {
   id: string;
-  /** Position by score within the current filter; null while unscored. */
+  /** Rank by score within the current view (job or stage), as exports number it; null while unscored. */
   rank: number | null;
   name: string;
   subline: string | null;
@@ -36,13 +39,38 @@ export type CandidateRow = {
 
 const ACTION_BATCH = 500;
 
-type BulkAction = "shortlisted" | "rejected" | "new" | "rescore" | "rescore-all";
+type BulkAction = "shortlisted" | "rejected" | "new" | "rescore" | "rescore-all" | "delete";
+type ExportFormat = "csv" | "xlsx" | "zip";
 
-function exportHref(jobId: string, format: "csv" | "xlsx" | "zip", filter: { ids?: string[]; stage?: CandidateStage | null }) {
-  const params = new URLSearchParams({ format });
-  if (filter.ids) params.set("ids", filter.ids.join(","));
-  else if (filter.stage) params.set("stage", filter.stage);
-  return `/api/jobs/${jobId}/export?${params}`;
+const EXPORT_BUTTONS: Array<{ format: ExportFormat; label: string; done: string }> = [
+  { format: "csv", label: "CSV", done: "CSV export downloaded" },
+  { format: "xlsx", label: "Excel", done: "Excel export downloaded" },
+  { format: "zip", label: "ZIP of CVs", done: "ZIP of CVs downloaded" },
+];
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+function outcomeMessage(action: BulkAction, count: number): string {
+  if (count === 0) return "Nothing changed — those candidates may have been removed already.";
+  const n = plural(count, "candidate");
+  switch (action) {
+    case "shortlisted":
+    case "rejected":
+      return `${n} ${CANDIDATE_STAGE_LABELS[action].toLowerCase()}`;
+    case "new":
+      return `${n} moved to ${CANDIDATE_STAGE_LABELS.new}`;
+    case "rescore":
+    case "rescore-all":
+      return `Re-scoring ${n}`;
+    case "delete":
+      return `${n} deleted`;
+  }
+}
+
+function failureMessage(action: BulkAction): string {
+  if (action === "delete") return "Couldn't delete the candidates. Try again.";
+  if (action === "rescore" || action === "rescore-all") return "Couldn't start re-scoring. Try again.";
+  return "Couldn't update the candidates. Try again.";
 }
 
 async function inBatches(ids: string[], run: (batch: string[]) => Promise<ReviewActionResult>): Promise<ReviewActionResult> {
@@ -66,56 +94,106 @@ export function CandidatesTable({
   stage: CandidateStage | null;
   totalInJob: number;
 }) {
+  const announce = useAnnounce();
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [pending, startTransition] = useTransition();
   const [busy, setBusy] = useState<BulkAction | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [confirmRescoreAll, setConfirmRescoreAll] = useState(false);
+  // Result of the last bulk action, shown in the toolbar until the selection changes.
+  const [notice, setNotice] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<"rescore-all" | "delete" | null>(null);
+  const [exporting, setExporting] = useState<ExportFormat | null>(null);
+  const restoreFocus = useRestoreFocus();
+  const ids = {
+    selectAll: useId(),
+    deleteTrigger: useId(),
+    deleteText: useId(),
+    rescoreAllTrigger: useId(),
+    rescoreAllText: useId(),
+  };
 
   // Rows can leave the list (stage change, deletion, refresh), so selection is always intersected with what's shown.
   const selectedIds = rows.filter((r) => selected.has(r.id)).map((r) => r.id);
   const allSelected = rows.length > 0 && selectedIds.length === rows.length;
   const someSelected = selectedIds.length > 0 && !allSelected;
   const activeAction = pending ? busy : null;
+  const confirmingDelete = confirm === "delete" && selectedIds.length > 0;
+
+  function changeSelection(next: Set<string>) {
+    setSelected(next);
+    setConfirm(null);
+    setNotice(null);
+  }
 
   function toggle(id: string) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    changeSelection(next);
   }
 
   function toggleAll() {
-    setSelected(allSelected ? new Set() : new Set(rows.map((r) => r.id)));
+    changeSelection(allSelected ? new Set() : new Set(rows.map((r) => r.id)));
   }
 
   function run(action: BulkAction, call: () => Promise<ReviewActionResult>) {
     setError(null);
+    setNotice(null);
     setBusy(action);
     startTransition(async () => {
       try {
         const result = await call();
-        if (!result.ok) setError(result.error);
-        else {
-          setSelected(new Set());
-          setConfirmRescoreAll(false);
+        if (!result.ok) {
+          setError(result.error);
+          return;
         }
+        const message = outcomeMessage(action, result.count);
+        setSelected(new Set());
+        setConfirm(null);
+        setNotice(message);
+        announce(message);
+        // The toolbar swaps its buttons back, so the one that was clicked is gone.
+        restoreFocus(ids.selectAll);
       } catch (err) {
         unstable_rethrow(err);
-        setError(action.startsWith("rescore") ? "Couldn't start re-scoring. Try again." : "Couldn't update the candidates. Try again.");
+        setError(failureMessage(action));
       }
     });
+  }
+
+  function cancelConfirm() {
+    const trigger = confirm === "delete" ? ids.deleteTrigger : ids.rescoreAllTrigger;
+    setConfirm(null);
+    restoreFocus(trigger);
   }
 
   const moveTo = (target: CandidateStage) => () =>
     run(target, () => inBatches(selectedIds, (batch) => updateStageAction(jobId, batch, target)));
   const rescoreSelected = () => run("rescore", () => inBatches(selectedIds, (batch) => rescoreAction(jobId, batch)));
   const rescoreAll = () => run("rescore-all", () => rescoreAction(jobId, "all"));
+  const deleteSelected = () => run("delete", () => inBatches(selectedIds, (batch) => deleteCandidatesAction(jobId, batch)));
 
-  // Exporting every visible row is the same as exporting the filter, and keeps the URL short.
-  const exportFilter = selectedIds.length > 0 && !allSelected ? { ids: selectedIds } : { stage };
+  // Exporting every visible row is the same as exporting the view, and needs no id list.
+  const exportSelection = selectedIds.length > 0 && !allSelected;
+
+  async function exportAs(format: ExportFormat, done: string) {
+    setError(null);
+    setExporting(format);
+    const fallbackName = `candidates.${format}`;
+    // The stage goes along with a selection too, so exported ranks match the ones on screen.
+    const fields: Record<string, string> = stage ? { format, stage } : { format };
+    const outcome = exportSelection
+      ? // Intentional: POST for selections — hundreds of ids overflow URL length limits.
+        await downloadFile(
+          `/api/jobs/${jobId}/export`,
+          { method: "POST", body: new URLSearchParams({ ...fields, ids: selectedIds.join(",") }) },
+          fallbackName,
+        )
+      : await downloadFile(`/api/jobs/${jobId}/export?${new URLSearchParams(fields)}`, undefined, fallbackName);
+    setExporting(null);
+    if (outcome.ok) announce(done);
+    else setError(outcome.sessionExpired ? outcome.error : `Couldn't export — ${outcome.error}`);
+  }
 
   const actionIcon = (action: BulkAction, Icon: typeof Check) =>
     activeAction === action ? <Loader2 className="animate-spin" aria-hidden /> : <Icon aria-hidden />;
@@ -127,14 +205,26 @@ export function CandidatesTable({
         aria-label="Candidate actions"
         className={cn(
           "flex flex-wrap items-center justify-between gap-x-4 gap-y-3 border-b border-line px-4 py-3",
-          selectedIds.length > 0 && "bg-brand-soft/40",
+          confirmingDelete ? "bg-danger-soft/60" : selectedIds.length > 0 && "bg-brand-soft/40",
         )}
       >
-        {selectedIds.length > 0 ? (
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="mr-1 text-sm font-medium text-ink tabular-nums" aria-live="polite">
-              {selectedIds.length} selected
+        {confirmingDelete ? (
+          <div role="group" aria-labelledby={ids.deleteText} className="flex flex-wrap items-center gap-2">
+            <span id={ids.deleteText} className="mr-1 text-sm text-danger">
+              Permanently delete {plural(selectedIds.length, "candidate")} and{" "}
+              {selectedIds.length === 1 ? "their CV" : "their CVs"}? This can&apos;t be undone.
             </span>
+            <Button variant="danger" size="sm" onClick={deleteSelected} disabled={pending}>
+              {actionIcon("delete", Trash2)}
+              Delete {plural(selectedIds.length, "candidate")}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={cancelConfirm} disabled={pending} autoFocus>
+              Cancel
+            </Button>
+          </div>
+        ) : selectedIds.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="mr-1 text-sm font-medium text-ink tabular-nums">{selectedIds.length} selected</span>
             <Button variant="secondary" size="sm" onClick={moveTo("shortlisted")} disabled={pending}>
               {actionIcon("shortlisted", Check)}
               Shortlist
@@ -151,27 +241,56 @@ export function CandidatesTable({
               {actionIcon("rescore", RefreshCw)}
               Re-score
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => setSelected(new Set())} disabled={pending}>
+            <Button
+              id={ids.deleteTrigger}
+              variant="danger"
+              size="sm"
+              onClick={() => {
+                setError(null);
+                setConfirm("delete");
+              }}
+              disabled={pending}
+            >
+              <Trash2 aria-hidden />
+              Delete
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => changeSelection(new Set())} disabled={pending}>
               Clear selection
             </Button>
           </div>
-        ) : confirmRescoreAll ? (
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm text-ink">
+        ) : confirm === "rescore-all" ? (
+          <div role="group" aria-labelledby={ids.rescoreAllText} className="flex flex-wrap items-center gap-2">
+            <span id={ids.rescoreAllText} className="text-sm text-ink">
               Re-run the AI ranking for all {totalInJob} candidates in this job?
             </span>
             <Button size="sm" onClick={rescoreAll} disabled={pending}>
               {actionIcon("rescore-all", RefreshCw)}
               Re-score all
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => setConfirmRescoreAll(false)} disabled={pending} autoFocus>
+            <Button variant="ghost" size="sm" onClick={cancelConfirm} disabled={pending} autoFocus>
               Cancel
             </Button>
           </div>
         ) : (
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm text-ink-muted">Ranked by match score</span>
-            <Button variant="ghost" size="sm" onClick={() => setConfirmRescoreAll(true)}>
+            {notice ? (
+              <span className="inline-flex items-center gap-1.5 text-sm text-ink">
+                <CheckCircle2 className="size-4 shrink-0 text-success" aria-hidden />
+                {notice}
+              </span>
+            ) : (
+              <span className="text-sm text-ink-muted">Ranked by match score</span>
+            )}
+            <Button
+              id={ids.rescoreAllTrigger}
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                setError(null);
+                setNotice(null);
+                setConfirm("rescore-all");
+              }}
+            >
               <RefreshCw aria-hidden />
               Re-score all
             </Button>
@@ -179,21 +298,19 @@ export function CandidatesTable({
         )}
 
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-sm text-ink-muted">
-            Export{selectedIds.length > 0 && !allSelected ? " selected" : ""}
-          </span>
-          <a href={exportHref(jobId, "csv", exportFilter)} download className={buttonClass("secondary", "sm")}>
-            <Download aria-hidden />
-            CSV
-          </a>
-          <a href={exportHref(jobId, "xlsx", exportFilter)} download className={buttonClass("secondary", "sm")}>
-            <Download aria-hidden />
-            Excel
-          </a>
-          <a href={exportHref(jobId, "zip", exportFilter)} download className={buttonClass("secondary", "sm")}>
-            <Download aria-hidden />
-            ZIP of CVs
-          </a>
+          <span className="text-sm text-ink-muted">Export{exportSelection ? " selected" : ""}</span>
+          {EXPORT_BUTTONS.map(({ format, label, done }) => (
+            <Button
+              key={format}
+              variant="secondary"
+              size="sm"
+              onClick={() => exportAs(format, done)}
+              disabled={exporting !== null}
+            >
+              {exporting === format ? <Loader2 className="animate-spin" aria-hidden /> : <Download aria-hidden />}
+              {label}
+            </Button>
+          ))}
         </div>
       </div>
 
@@ -210,6 +327,7 @@ export function CandidatesTable({
             <tr>
               <th scope="col" className="w-10 py-2.5 pr-2 pl-4">
                 <input
+                  id={ids.selectAll}
                   type="checkbox"
                   aria-label="Select all candidates"
                   checked={allSelected}
