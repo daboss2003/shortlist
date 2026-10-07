@@ -22,7 +22,7 @@ async function LoginContent() {
     <AuthCard
       title="Log in"
       description="Welcome back. Your jobs and ranked candidates are waiting."
-      footer={{ prompt: "New here?", href: "/signup", label: "Create an account" }}
+      footer="Have an invite? Use the link you were sent."
     >
       <LoginForm />
     </AuthCard>

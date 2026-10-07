@@ -5,6 +5,14 @@ import { Card } from "@/components/ui/card";
 const textLinkClass =
   "rounded-sm font-medium text-brand-ink underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand";
 
+export function TextLink({ href, children }: { href: string; children: ReactNode }) {
+  return (
+    <Link href={href} className={textLinkClass}>
+      {children}
+    </Link>
+  );
+}
+
 export function AuthCard({
   title,
   description,
@@ -14,7 +22,7 @@ export function AuthCard({
   title: string;
   description: string;
   children: ReactNode;
-  footer: { prompt: string; href: string; label: string };
+  footer?: ReactNode;
 }) {
   return (
     <div className="space-y-6">
@@ -23,12 +31,7 @@ export function AuthCard({
         <p className="mt-1 text-sm text-ink-muted">{description}</p>
         <div className="mt-6">{children}</div>
       </Card>
-      <p className="text-center text-sm text-ink-muted">
-        {footer.prompt}{" "}
-        <Link href={footer.href} className={textLinkClass}>
-          {footer.label}
-        </Link>
-      </p>
+      {footer && <p className="text-center text-sm text-ink-muted">{footer}</p>}
     </div>
   );
 }

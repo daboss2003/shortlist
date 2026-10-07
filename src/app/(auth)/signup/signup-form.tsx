@@ -9,7 +9,7 @@ import { signupAction, type SignupState } from "../actions";
 
 const initialState: SignupState = {};
 
-export function SignupForm() {
+export function SignupForm({ inviteToken, invitedEmail }: { inviteToken: string; invitedEmail: string | null }) {
   const [state, formAction] = useActionState(signupAction, initialState);
   const errors = state.fieldErrors ?? {};
   const values = state.values ?? {};
@@ -22,6 +22,7 @@ export function SignupForm() {
   return (
     <form ref={formRef} action={formAction} noValidate className="space-y-5">
       {state.formError && <Alert tone="danger" title={state.formError} />}
+      <input type="hidden" name="invite" value={inviteToken} />
 
       <Field id="companyName" label="Company name" error={errors.companyName}>
         <Input
@@ -69,7 +70,12 @@ export function SignupForm() {
         />
       </Field>
 
-      <Field id="email" label="Work email" error={errors.email}>
+      <Field
+        id="email"
+        label="Work email"
+        hint={invitedEmail ? "This invite is for this email address." : undefined}
+        error={errors.email}
+      >
         <Input
           id="email"
           name="email"
@@ -80,8 +86,11 @@ export function SignupForm() {
           spellCheck={false}
           required
           maxLength={200}
-          defaultValue={values.email}
-          {...fieldA11y("email", errors.email)}
+          // The server only redeems an email-bound invite for that email; locking the field just says so up front.
+          readOnly={invitedEmail !== null}
+          className="read-only:bg-subtle read-only:text-ink-muted"
+          defaultValue={invitedEmail ?? values.email}
+          {...fieldA11y("email", errors.email, invitedEmail !== null)}
         />
       </Field>
 

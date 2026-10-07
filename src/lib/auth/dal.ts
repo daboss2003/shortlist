@@ -2,7 +2,7 @@ import "server-only";
 import { cache } from "react";
 import { cookies } from "next/headers";
 import { connection } from "next/server";
-import { redirect } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import { SESSION_COOKIE, findEmployerBySessionToken, type Employer } from "./session";
 
 export type { Employer };
@@ -20,5 +20,12 @@ export const getCurrentEmployer = cache(async (): Promise<Employer | null> => {
 export async function requireEmployer(): Promise<Employer> {
   const employer = await getCurrentEmployer();
   if (!employer) redirect("/login");
+  return employer;
+}
+
+/** For platform-admin pages and actions. Anyone else gets a 404, so the page's existence isn't revealed. */
+export async function requirePlatformAdmin(): Promise<Employer> {
+  const employer = await requireEmployer();
+  if (employer.isPlatformAdmin !== true) notFound();
   return employer;
 }

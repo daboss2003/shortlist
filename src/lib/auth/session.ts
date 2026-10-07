@@ -17,6 +17,11 @@ export type Employer = {
   companyId: string;
   companyName: string;
   companyWebsite: string | null;
+  /**
+   * Platform operator (can invite companies). Always set from the session; optional only so test fixtures
+   * written before it existed still type-check. Absent means not an admin.
+   */
+  isPlatformAdmin?: boolean;
 };
 
 /** Creates a session row and returns the raw token (only the hash is stored). */
@@ -37,6 +42,7 @@ export function findEmployerBySessionToken(token: string): Employer | null {
       companyId: companies.id,
       companyName: companies.name,
       companyWebsite: companies.website,
+      isPlatformAdmin: users.isPlatformAdmin,
     })
     .from(sessions)
     .innerJoin(users, eq(users.id, sessions.userId))

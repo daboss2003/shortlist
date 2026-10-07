@@ -3,12 +3,13 @@ import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { companies, users } from "@/db/schema";
+import { INVITE_ERROR, findUsableInvite, redeemInvite } from "./invites";
 import { hashPassword, verifyPassword } from "./password";
 
 const WEBSITE_ERROR = "Enter a valid website, like acme.com.";
 
 /** "acme.com" → "https://acme.com". Only http(s) on a dotted host, no credentials. Empty → null. */
-const websiteSchema = z
+export const websiteSchema = z
   .string()
   .trim()
   .optional()
@@ -40,13 +41,15 @@ const websiteSchema = z
     return normalized;
   });
 
+export const companyNameSchema = z
+  .string()
+  .trim()
+  .min(1, "Enter your company name.")
+  .min(2, "Company name must be at least 2 characters.")
+  .max(120, "Keep the company name under 120 characters.");
+
 export const signupSchema = z.object({
-  companyName: z
-    .string()
-    .trim()
-    .min(1, "Enter your company name.")
-    .min(2, "Company name must be at least 2 characters.")
-    .max(120, "Keep the company name under 120 characters."),
+  companyName: companyNameSchema,
   website: websiteSchema,
   name: z.string().trim().min(1, "Enter your name.").max(120, "Keep your name under 120 characters."),
   email: z
@@ -63,10 +66,23 @@ export type SignupInput = z.output<typeof signupSchema>;
 export type SignupField = keyof SignupInput;
 export type SignupFieldErrors = Partial<Record<SignupField, string>>;
 
-export type RegisterResult = { ok: true; userId: string } | { ok: false; fieldErrors: SignupFieldErrors };
+export type RegisterResult =
+  | { ok: true; userId: string }
+  | { ok: false; fieldErrors: SignupFieldErrors; formError?: string };
 
-/** Validates the signup form and creates a company with its first user. */
-export async function registerCompany(input: unknown): Promise<RegisterResult> {
+const inviteFailure = (): RegisterResult => ({ ok: false, fieldErrors: {}, formError: INVITE_ERROR });
+
+class InviteNotRedeemedError extends Error {}
+
+/**
+ * Validates the signup form and creates a company with its first user, redeeming the invite in the same
+ * transaction. Any unusable invite (missing, expired, used, revoked, for another email) gets one generic error.
+ */
+export async function registerCompany(input: unknown, inviteToken: unknown): Promise<RegisterResult> {
+  // Cheap early exit so invite-less submissions never cost a password hash. Redemption below re-checks atomically.
+  const invite = findUsableInvite(inviteToken);
+  if (!invite) return inviteFailure();
+
   const parsed = signupSchema.safeParse(input);
   if (!parsed.success) {
     const { fieldErrors } = z.flattenError(parsed.error);
@@ -79,24 +95,36 @@ export async function registerCompany(input: unknown): Promise<RegisterResult> {
   }
 
   const data = parsed.data;
+  if (invite.email && invite.email !== data.email) return inviteFailure();
+
   // Hash first: better-sqlite3 transactions are synchronous and can't span an await.
   const passwordHash = await hashPassword(data.password);
   try {
     const userId = db.transaction((tx) => {
       const company = tx.insert(companies).values({ name: data.companyName, website: data.website }).returning().get();
-      return tx
+      const id = tx
         .insert(users)
         .values({ companyId: company.id, name: data.name, email: data.email, passwordHash })
         .returning({ id: users.id })
         .get().id;
+      // Used, revoked or expired since the check above (e.g. a parallel signup with the same link): roll back.
+      if (!redeemInvite(tx, inviteToken, id, data.email)) throw new InviteNotRedeemedError();
+      return id;
     });
     return { ok: true, userId };
   } catch (err) {
+    if (err instanceof InviteNotRedeemedError) return inviteFailure();
     if (isUniqueViolation(err)) {
       return { ok: false, fieldErrors: { email: "An account with this email already exists." } };
     }
     throw err;
   }
+}
+
+/** Whether an account already uses this email (any casing). */
+export function accountExists(email: string): boolean {
+  const normalized = email.trim().toLowerCase();
+  return !!normalized && !!db.select({ id: users.id }).from(users).where(eq(users.email, normalized)).get();
 }
 
 // A real scrypt hash (same N/r/p and key length as hashPassword) of a random password nobody knows.
