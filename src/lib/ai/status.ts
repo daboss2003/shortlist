@@ -1,4 +1,5 @@
 import "server-only";
+import { resolveProviderChain } from "@/lib/ai/providers";
 
 // CONTRACT (frozen) — implemented by the AI/pipeline workstream. Used by the dashboard to show
 // which AI is ranking candidates, or a setup warning when no provider key is configured.
@@ -17,5 +18,7 @@ export type AiStatus = {
 };
 
 export function getAiStatus(): AiStatus {
-  throw new Error("not implemented");
+  const { chain, error } = resolveProviderChain();
+  const [primary = null, ...fallbacks] = chain.map(({ id, label, modelId }): AiProviderInfo => ({ id, label, modelId }));
+  return { primary, fallbacks, error };
 }

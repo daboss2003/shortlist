@@ -8,11 +8,12 @@ import type { CvFileType } from "@/lib/cv/file-type";
 
 const KEY_PATTERN = /^[0-9a-f-]{36}\.(pdf|docx|txt)$/;
 
-const uploadDir = () => process.env.UPLOAD_DIR ?? path.join(process.cwd(), "data", "uploads");
+// Intentional: turbopackIgnore — uploads are runtime data, not code; without it the build traces the whole project.
+const uploadDir = () => process.env.UPLOAD_DIR ?? path.join(/*turbopackIgnore: true*/ process.cwd(), "data", "uploads");
 
 function keyPath(key: string): string {
   if (!KEY_PATTERN.test(key)) throw new Error("Invalid storage key");
-  return path.join(uploadDir(), key);
+  return path.join(/*turbopackIgnore: true*/ uploadDir(), key);
 }
 
 export async function saveCvFile(bytes: Buffer, fileType: CvFileType): Promise<string> {
@@ -23,7 +24,7 @@ export async function saveCvFile(bytes: Buffer, fileType: CvFileType): Promise<s
 }
 
 export async function readCvFile(key: string): Promise<Buffer> {
-  return fs.readFile(keyPath(key));
+  return fs.readFile(/*turbopackIgnore: true*/ keyPath(key));
 }
 
 export async function deleteCvFile(key: string): Promise<void> {

@@ -1,5 +1,6 @@
 import type { CandidateSource, CandidateStage, CandidateStatus, EmploymentType, JobStatus } from "@/db/schema";
 import type { Recommendation } from "@/lib/ai/schemas";
+import type { AiProviderId } from "@/lib/ai/status";
 
 // Single source of human-readable labels — used by UI and exports alike.
 
@@ -37,6 +38,17 @@ export const RECOMMENDATION_LABELS: Record<Recommendation, string> = {
   possible_fit: "Possible fit",
   not_a_fit: "Not a fit",
 };
+
+export const AI_PROVIDER_LABELS: Record<AiProviderId, string> = {
+  gemini: "Google Gemini",
+  openai: "OpenAI",
+  anthropic: "Anthropic Claude",
+  groq: "Groq",
+  "openai-compatible": "OpenAI-compatible",
+};
+
+/** Label for a stored `candidates.ai_provider` value (unknown ids from older data fall back to the raw id). */
+export const aiProviderLabel = (id: string) => AI_PROVIDER_LABELS[id as AiProviderId] ?? id;
 
 export type ScoreTone = "success" | "warning" | "danger";
 
