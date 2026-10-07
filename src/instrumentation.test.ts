@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { register } from "./instrumentation";
 
 const calls = vi.hoisted(() => [] as string[]);
+const schema = vi.hoisted(() => ({ problem: null as string | null }));
 
-vi.mock("@/db", () => ({ ensureDbReady: async () => void calls.push("ensureDbReady") }));
+vi.mock("@/db", () => ({
+  ensureDbReady: async () => void calls.push("ensureDbReady"),
+  findSchemaProblem: async () => schema.problem,
+}));
 vi.mock("@/lib/auth/seed-admin", () => ({ seedPlatformAdmin: async () => void calls.push("seedPlatformAdmin") }));
 vi.mock("@/lib/pipeline", () => ({
   recoverInterruptedCandidates: async () => void calls.push("recoverInterruptedCandidates"),
@@ -13,6 +17,7 @@ vi.mock("@/lib/retention", () => ({ startRetentionSweeper: () => void calls.push
 
 beforeEach(() => {
   calls.length = 0;
+  schema.problem = null;
   vi.stubEnv("NEXT_RUNTIME", "nodejs");
 });
 
@@ -40,6 +45,15 @@ describe("register", () => {
     vi.stubEnv(name, value);
     await register();
     expect(calls).toEqual(["ensureDbReady", "seedPlatformAdmin"]);
+  });
+
+  it("explains a missing schema and skips seeding and recovery, instead of failing later", async () => {
+    schema.problem = "The database at DATABASE_URL has no tables yet. Run `pnpm db:migrate`.";
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await register();
+    expect(calls).toEqual(["ensureDbReady"]);
+    expect(error).toHaveBeenCalledWith(`[db] ${schema.problem}`);
+    error.mockRestore();
   });
 
   it("does nothing in the edge runtime", async () => {

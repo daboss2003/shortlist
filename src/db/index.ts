@@ -2,6 +2,7 @@ import "server-only";
 import fs from "node:fs";
 import path from "node:path";
 import { PGlite } from "@electric-sql/pglite";
+import { sql } from "drizzle-orm";
 import { Pool, neon } from "@neondatabase/serverless";
 import type { PgDatabase, PgQueryResultHKT } from "drizzle-orm/pg-core";
 import { drizzle as drizzleNeonHttp } from "drizzle-orm/neon-http";
@@ -89,4 +90,25 @@ export const db: Db = new Proxy({} as Db, {
 /** Resolves once the local (PGlite) schema is migrated. A no-op in production. Await before the first query. */
 export function ensureDbReady(): Promise<void> {
   return state().ready;
+}
+
+/**
+ * Startup sanity check for a hosted database (DATABASE_URL): returns a human instruction when Shortlist's tables are
+ * missing, else null. Read-only. PGlite migrates itself, so it's never reported there.
+ */
+export async function findSchemaProblem(): Promise<string | null> {
+  if (!process.env.DATABASE_URL) return null;
+  const result = await db.execute(
+    sql`select to_regclass('public.candidates') is not null as ours,
+          (select count(*)::int from information_schema.tables where table_schema = 'public') as tables`,
+  );
+  const row = (Array.isArray(result) ? result[0] : (result as { rows: unknown[] }).rows[0]) as
+    | { ours: boolean; tables: number }
+    | undefined;
+  if (!row || row.ours) return null;
+  return row.tables > 0
+    ? "DATABASE_URL points at a database that belongs to something else (it has other tables but no Shortlist " +
+        "tables). Give Shortlist its own Neon database, then run `pnpm db:migrate`."
+    : "The database at DATABASE_URL has no tables yet. Run `pnpm db:migrate` (on Netlify it runs during the " +
+        "production build).";
 }

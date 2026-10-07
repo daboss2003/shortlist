@@ -1,8 +1,17 @@
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
 
-  const { ensureDbReady } = await import("@/db");
+  const { ensureDbReady, findSchemaProblem } = await import("@/db");
   await ensureDbReady();
+  const problem = await findSchemaProblem().catch((err: unknown) =>
+    `Couldn't reach the database at DATABASE_URL: ${err instanceof Error ? err.message.split("\n")[0] : String(err)}`,
+  );
+  if (problem) {
+    // Intentional: start anyway (pages show the error boundary) but say exactly what to fix, once, at boot —
+    // instead of an opaque "relation does not exist" on the first login.
+    console.error(`[db] ${problem}`);
+    return;
+  }
   const { seedPlatformAdmin } = await import("@/lib/auth/seed-admin");
   await seedPlatformAdmin();
 

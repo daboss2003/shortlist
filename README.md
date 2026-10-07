@@ -23,6 +23,10 @@ cp .env.example .env.local      # add an AI key (GEMINI_API_KEY is the default) 
 pnpm dev                        # http://localhost:3000
 ```
 
+Leave `DATABASE_URL` empty locally to use the embedded database, which needs no setup. To develop against Neon
+instead, point `DATABASE_URL` at a database **dedicated to Shortlist** and run `pnpm db:migrate` once. The migrate
+command refuses to touch a database that already holds another app's tables.
+
 1. **First admin:** with `ADMIN_EMAIL` and `ADMIN_PASSWORD` (12+ characters) set, the platform admin account is created
    when the server starts. Log in at `/login`.
 2. Signups are **invite-only**. As the admin, open **Invites** in the dashboard to create a one-time signup link for each
